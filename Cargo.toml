@@ -1,0 +1,31 @@
+[package]
+name = "gac"
+version = "0.1.0"
+edition = "2021"
+description = "AI-powered CLI tool for generating meaningful commit messages using Ollama"
+authors = ["Cumali Dikmen <cumalidikmen@gmail.com>"]
+license = "MIT"
+keywords = ["git", "commit", "ollama", "ai", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = { version = "1.0" }
+askama = { version = "0.15" }
+clap = { version = "4.6", features = ["derive"] }
+dialoguer = { version = "0.12" }
+dirs = { version = "6.0" }
+futures-util = { version = "0.3" }
+glob = { version = "0.3" }
+reqwest = { version = "0.13", features = ["json", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0" }
+tokio = { version = "1.50", features = ["full"] }
+toml = { version = "1.0" }
+tracing = { version = "0.1" }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+panic = "abort"
