@@ -1,0 +1,1 @@
+- Scope: Infer the most specific scope from the changed file paths or module names; omit only when genuinely unclear
