@@ -1,0 +1,31 @@
+# gac config
+[model]
+name = "cogito:8b"
+ollama_url = "http://localhost:11434"
+think = false
+
+[options]
+num_ctx = 2048
+num_predict = 256
+temperature = 0.2
+top_p = 0.9
+num_gpu = 999
+
+[diff]
+max_chars = 6000
+exclude_patterns = [
+  "package-lock.json",
+  "yarn.lock",
+  "pnpm-lock.yaml",
+  "bun.lockb",
+  "Cargo.lock",
+  "poetry.lock",
+  "*.lock",
+]
+
+[scopes.api]
+paths = ["src/api/**", "src/routes/**"]
+[scopes.cli]
+paths = ["src/cli/**", "src/main.rs"]
+[scopes.db]
+paths = ["src/db/**", "migrations/**"]
