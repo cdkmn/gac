@@ -58,11 +58,15 @@ struct Cli {
 
 fn init_config() -> Result<()> {
     let path = ".gac.toml";
+
     if Path::new(path).exists() {
         anyhow::bail!("{path} already exists.");
     }
+
     std::fs::write(path, DEFAULT_CONFIG)?;
+
     info!(path, "project config created");
+
     Ok(())
 }
 
