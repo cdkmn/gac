@@ -1,0 +1,1 @@
+- Scope: MUST be `{{ single }}`
