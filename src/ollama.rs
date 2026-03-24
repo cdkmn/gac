@@ -1,5 +1,6 @@
 use anyhow::Result;
 use futures_util::StreamExt;
+use indicatif::MultiProgress;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
@@ -7,6 +8,7 @@ use tracing::{debug, info, warn};
 use crate::{
     config::{Config, OllamaOptions},
     prompt::Prompt,
+    spinner,
     stats::GenerationStats,
 };
 
@@ -158,6 +160,7 @@ async fn query_vram(base_url: &str, model_name: &str) -> Option<u64> {
 pub async fn generate_streaming(
     config: &Config,
     prompt: &Prompt,
+    mp: &MultiProgress,
 ) -> Result<(String, GenerationStats)> {
     let client = Client::new();
 
@@ -172,18 +175,27 @@ pub async fn generate_streaming(
     info!(model = %config.model, num_ctx = config.options.num_ctx, "sending chat request");
     debug!(system = prompt.system, user = prompt.user);
 
-    let response = check_response(
+    // Start spinner before the network call so latency is always covered
+    let spin = spinner::generation_spinner(mp, &config.model);
+    let response = match check_response(
         client
             .post(format!("{}/api/chat", config.ollama_url))
             .json(&req)
             .send()
             .await?,
     )
-    .await?;
-
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            spinner::fail(&spin, format!("request failed: {e}"));
+            return Err(e);
+        }
+    };
     let mut stream = response.bytes_stream();
     let mut result = String::new();
     let mut stats = GenerationStats::default();
+    let mut first_token = true;
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk?;
@@ -193,26 +205,47 @@ pub async fn generate_streaming(
                 continue;
             }
 
-            if let Ok(parsed) = serde_json::from_str::<ChatChunk>(line) {
-                if let Some(msg) = &parsed.message {
+            let Ok(parsed) = serde_json::from_str::<ChatChunk>(line) else {
+                continue;
+            };
+
+            if let Some(msg) = &parsed.message {
+                if !msg.content.is_empty() {
+                    if first_token {
+                        // Clear the spinner before printing anything to stdout
+                        // so the two streams don't interleave visually.
+                        spinner::clear(&spin);
+                        print!("\n💬 ");
+                        first_token = false;
+                    }
                     result.push_str(&msg.content);
                 }
+            }
 
-                if parsed.done {
-                    // Capture all stat fields from the final chunk
-                    stats.input_tokens = parsed.prompt_eval_count;
-                    stats.output_tokens = parsed.eval_count;
-                    stats.prompt_eval_ns = parsed.prompt_eval_duration;
-                    stats.eval_ns = parsed.eval_duration;
-                    stats.total_ns = parsed.total_duration;
-                    break;
-                }
+            if parsed.done {
+                // Capture all stat fields from the final chunk
+                stats.input_tokens = parsed.prompt_eval_count;
+                stats.output_tokens = parsed.eval_count;
+                stats.prompt_eval_ns = parsed.prompt_eval_duration;
+                stats.eval_ns = parsed.eval_duration;
+                stats.total_ns = parsed.total_duration;
+                break;
             }
         }
     }
 
-    // VRAM query is best-effort — runs after streaming completes
+    // Always ensure a clean line after streaming, whether we got tokens or not
+    if !first_token {
+        println!();
+    } else {
+        // No tokens arrived at all — clean up the spinner as an error
+        spinner::fail(&spin, "no response received from model");
+    }
+
+    // VRAM query after streaming — best-effort, never blocks the happy path
+    let vram_spin = spinner::step_spinner(mp, "querying VRAM usage…");
     let vram_used = query_vram(&config.ollama_url, &config.model).await;
+    spinner::clear(&vram_spin);
     stats.vram_bytes = vram_used;
 
     Ok((result.trim().to_string(), stats))

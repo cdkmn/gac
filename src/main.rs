@@ -4,6 +4,7 @@ mod git;
 mod logging;
 mod ollama;
 mod prompt;
+mod spinner;
 mod stats;
 
 use anyhow::Result;
@@ -149,6 +150,9 @@ async fn main() -> Result<()> {
         };
     }
 
+    // ── Shared MultiProgress — all spinners/bars share one instance ───────
+    let mp = spinner::multi();
+
     // ── Config ────────────────────────────────────────────────────────────
     let mut config = Config::load()?;
     config.apply_cli_overrides(cli.model, cli.num_ctx);
@@ -181,9 +185,22 @@ async fn main() -> Result<()> {
     }
 
     // ── Raw diff ──────────────────────────────────────────────────────────
-    info!("reading staged diff");
-    let (stat, raw_diff) = git::get_staged_stat_and_diff(&config.exclude_patterns)?;
-
+    let diff_spin = spinner::step_spinner(&mp, "Reading staged diff…");
+    let (stat, raw_diff) =
+        git::get_staged_stat_and_diff(&config.exclude_patterns).inspect_err(|e| {
+            spinner::fail(&diff_spin, e.to_string());
+        })?;
+    spinner::done(
+        &diff_spin,
+        format!(
+            "read diff — {} chars across {} file(s)",
+            raw_diff.len(),
+            raw_diff
+                .lines()
+                .filter(|l| l.starts_with("diff --git"))
+                .count()
+        ),
+    );
     // ── Parse + score ─────────────────────────────────────────────────────
     let file_diffs = diff::parse_diff(&raw_diff);
     let strategy = diff::select_strategy(&file_diffs, config.max_diff_chars);
@@ -204,18 +221,22 @@ async fn main() -> Result<()> {
         }
         Strategy::Summarize => {
             info!(files = file_diffs.len(), "summarizing files individually");
+
+            // One shared progress bar for the whole summarize pass
+            let bar = spinner::summarize_bar(&mp, file_diffs.len());
             let mut summaries: HashMap<String, String> = HashMap::new();
 
             for (i, fd) in file_diffs.iter().enumerate() {
-                info!(
-                    progress = format!("{}/{}", i + 1, file_diffs.len()),
+                bar.set_message(fd.path.clone());
+                bar.set_position(i as u64);
+
+                debug!(
                     path     = %fd.path,
                     chars    = fd.char_count,
                     priority = fd.priority,
                     "summarizing file"
                 );
 
-                // Truncate the individual chunk if it's still huge
                 let chunk = if fd.char_count > config.max_diff_chars / 2 {
                     warn!(
                         path     = %fd.path,
@@ -239,7 +260,7 @@ async fn main() -> Result<()> {
                         summaries.insert(fd.path.clone(), s);
                     }
                     Err(e) => {
-                        warn!(path = %fd.path, error = %e, "file summarization failed — skipping");
+                        warn!(path = %fd.path, error = %e, "file summarization failed");
                         summaries.insert(
                             fd.path.clone(),
                             "(summary failed — see stat for details)".into(),
@@ -247,6 +268,10 @@ async fn main() -> Result<()> {
                     }
                 }
             }
+
+            // Finish bar at 100 %
+            bar.set_position(file_diffs.len() as u64);
+            spinner::done(&bar, format!("summarized {} files", file_diffs.len()));
 
             let body = diff::build_summary_context(&summaries);
             format!("=== Stat ===\n{stat}\n\n{body}")
@@ -272,11 +297,11 @@ async fn main() -> Result<()> {
         "generating commit message"
     );
 
-    // generate_streaming now returns (message, stats)
-    let (message, stats) = ollama::generate_streaming(&config, &commit_prompt).await?;
-
+    // mp is passed in so the generation spinner shares the same draw target
+    // as any bars that were active during the summarize pass.
+    let (message, gen_stats) = ollama::generate_streaming(&config, &commit_prompt, &mp).await?;
     // Print stats immediately after generation, before the approval dialog
-    stats.print();
+    gen_stats.print();
 
     // ── Approval + commit ─────────────────────────────────────────────────
     let final_message = match approval_dialog(&message)? {
