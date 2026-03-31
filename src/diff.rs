@@ -240,3 +240,109 @@ pub fn build_stat_context(stat: &str, files: &[FileDiff], top_n: usize) -> Strin
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_score_file_source() {
+        assert_eq!(score_file("src/main.rs"), 90);
+        assert_eq!(score_file("lib/utils.py"), 90);
+        assert_eq!(score_file("app/handler.ts"), 75);
+    }
+
+    #[test]
+    fn test_score_file_test() {
+        assert_eq!(score_file("src/main.test.ts"), 40);
+        assert_eq!(score_file("tests/unit.rs"), 40);
+        assert_eq!(score_file("src/__tests__/app.spec.js"), 40);
+    }
+
+    #[test]
+    fn test_score_file_low_priority() {
+        assert_eq!(score_file("package.json"), 20);
+        assert_eq!(score_file("Cargo.lock"), 0);
+        assert_eq!(score_file("README.md"), 20);
+    }
+
+    #[test]
+    fn test_score_file_unknown() {
+        assert_eq!(score_file("Makefile"), 50);
+        assert_eq!(score_file("Dockerfile"), 50);
+    }
+
+    #[test]
+    fn test_parse_diff_single_file() {
+        let raw = "diff --git a/src/main.rs b/src/main.rs\nindex abc123..def456 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n+new line\n fn main() {}\n";
+        let files = parse_diff(raw);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert!(files[0].content.contains("new line"));
+    }
+
+    #[test]
+    fn test_parse_diff_multiple_files() {
+        let raw = "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old readme\n+new readme\n";
+        let files = parse_diff(raw);
+        assert_eq!(files.len(), 2);
+        // Should be sorted by priority (src/main.rs is higher than README.md)
+        assert_eq!(files[0].path, "src/main.rs");
+        assert_eq!(files[1].path, "README.md");
+        assert!(files[0].priority > files[1].priority);
+    }
+
+    #[test]
+    fn test_select_strategy_direct() {
+        let files = vec![FileDiff {
+            path: "src/main.rs".into(),
+            priority: 90,
+            char_count: 1000,
+            content: "small diff".into(),
+        }];
+        assert_eq!(select_strategy(&files, 6000), Strategy::Direct);
+    }
+
+    #[test]
+    fn test_select_strategy_summarize() {
+        let files: Vec<FileDiff> = (0..5)
+            .map(|i| FileDiff {
+                path: format!("src/file{i}.rs"),
+                priority: 90,
+                char_count: 2000,
+                content: "diff".into(),
+            })
+            .collect();
+        // Total = 10000 > 6000, but only 5 files (< 20)
+        assert_eq!(select_strategy(&files, 6000), Strategy::Summarize);
+    }
+
+    #[test]
+    fn test_select_strategy_stat_only() {
+        let files: Vec<FileDiff> = (0..25)
+            .map(|i| FileDiff {
+                path: format!("src/file{i}.rs"),
+                priority: 90,
+                char_count: 1000,
+                content: "diff".into(),
+            })
+            .collect();
+        // 25 files > 20 threshold
+        match select_strategy(&files, 6000) {
+            Strategy::StatOnly { top_n } => assert!(top_n >= 1),
+            _ => panic!("expected StatOnly strategy"),
+        }
+    }
+
+    #[test]
+    fn test_build_summary_context() {
+        let mut summaries = HashMap::new();
+        summaries.insert("src/main.rs".into(), "Added main function".into());
+        summaries.insert("src/lib.rs".into(), "Updated imports".into());
+
+        let context = build_summary_context(&summaries);
+        assert!(context.contains("src/lib.rs"));
+        assert!(context.contains("src/main.rs"));
+        assert!(context.contains("Per-file change summaries"));
+    }
+}
