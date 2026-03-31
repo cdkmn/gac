@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use glob::Pattern;
 use std::{collections::HashMap, process::Command};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::config::ScopeEntry;
 
@@ -50,16 +50,19 @@ pub fn get_staged_stat_and_diff(exclude_patterns: &[String]) -> anyhow::Result<(
 
 /// Returns every file currently in the index, including excluded ones.
 pub fn get_staged_files() -> Vec<String> {
-    Command::new("git")
+    match Command::new("git")
         .args(["diff", "--cached", "--name-only"])
         .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.to_string())
-                .collect()
-        })
-        .unwrap_or_default()
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "failed to run git diff --cached --name-only");
+            Vec::new()
+        }
+    }
 }
 
 /// Returns files that were excluded by the exclude_patterns filter.
@@ -67,7 +70,7 @@ pub fn get_excluded_files(all: &[String], exclude_patterns: &[String]) -> Vec<St
     let excludes = build_excludes(exclude_patterns);
     let exclude_refs: Vec<&str> = excludes.iter().map(|s| s.as_str()).collect();
 
-    let kept: std::collections::HashSet<String> = Command::new("git")
+    let kept: std::collections::HashSet<String> = match Command::new("git")
         .args(
             ["diff", "--cached", "--name-only", "--"]
                 .iter()
@@ -75,13 +78,16 @@ pub fn get_excluded_files(all: &[String], exclude_patterns: &[String]) -> Vec<St
                 .copied(),
         )
         .output()
-        .map(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .map(|l| l.to_string())
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect(),
+        Err(e) => {
+            warn!(error = %e, "failed to run git diff with excludes");
+            std::collections::HashSet::new()
+        }
+    };
 
     all.iter().filter(|f| !kept.contains(*f)).cloned().collect()
 }
