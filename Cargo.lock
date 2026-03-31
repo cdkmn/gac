@@ -505,6 +505,7 @@ dependencies = [
  "futures-util",
  "glob",
  "indicatif",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",
