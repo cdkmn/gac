@@ -12,6 +12,9 @@ use crate::{
     stats::GenerationStats,
 };
 
+const MAX_RETRIES: usize = 2;
+const INITIAL_RETRY_DELAY_MS: u64 = 1000;
+
 // ── Chat message ──────────────────────────────────────────────────────────
 
 #[derive(Serialize, Clone)]
@@ -22,13 +25,18 @@ struct Message {
 
 // ── /api/chat request ─────────────────────────────────────────────────────
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     stream: bool,
+    #[serde(skip_serializing_if = "is_false")]
     think: bool,
     options: OllamaOptions,
+}
+
+fn is_false(v: &bool) -> bool {
+    !*v
 }
 
 // ── /api/chat streaming chunk ─────────────────────────────────────────────
@@ -87,6 +95,15 @@ struct PsModel {
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────
+
+/// Create a reusable HTTP client with sensible defaults.
+/// Call once per run and pass the reference to all API functions.
+pub fn create_client() -> Client {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .build()
+        .expect("failed to create HTTP client")
+}
 
 fn build_messages(prompt: &Prompt) -> Vec<Message> {
     vec![
@@ -153,17 +170,38 @@ async fn query_vram(base_url: &str, model_name: &str) -> Option<u64> {
     model.map(|m| m.size_vram)
 }
 
+/// Retry a fallible async operation with exponential backoff.
+async fn with_retry<T, F, Fut>(mut operation: F) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    let mut attempt = 0;
+
+    loop {
+        match operation().await {
+            Ok(result) => return Ok(result),
+            Err(e) if attempt < MAX_RETRIES => {
+                attempt += 1;
+                let delay_ms = INITIAL_RETRY_DELAY_MS * 2u64.pow(attempt as u32 - 1);
+                warn!(attempt, delay_ms, error = %e, "API call failed — retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 // ── Streaming generation — final commit message ───────────────────────────
 
 /// Generate a commit message with streaming output.
 /// Returns the generated text and a populated `GenerationStats`.
 pub async fn generate_streaming(
+    client: &Client,
     config: &Config,
     prompt: &Prompt,
     mp: &MultiProgress,
 ) -> Result<(String, GenerationStats)> {
-    let client = Client::new();
-
     let req = ChatRequest {
         model: config.model.clone(),
         messages: build_messages(prompt),
@@ -177,15 +215,16 @@ pub async fn generate_streaming(
 
     // Start spinner before the network call so latency is always covered
     let spin = spinner::generation_spinner(mp, &config.model);
-    let response = match check_response(
-        client
-            .post(format!("{}/api/chat", config.ollama_url))
-            .json(&req)
-            .send()
-            .await?,
-    )
-    .await
-    {
+
+    let response = with_retry(|| {
+        let client = client.clone();
+        let url = format!("{}/api/chat", config.ollama_url);
+        let req = req.clone();
+        async move { check_response(client.post(&url).json(&req).send().await?).await }
+    })
+    .await;
+
+    let response = match response {
         Ok(r) => r,
         Err(e) => {
             spinner::fail(&spin, format!("request failed: {e}"));
@@ -255,8 +294,7 @@ pub async fn generate_streaming(
 
 /// Summarize a single file diff. Returns text only — stats are not shown
 /// for the per-file pass to keep the progress display clean.
-pub async fn summarize(config: &Config, prompt: &Prompt) -> Result<String> {
-    let client = Client::new();
+pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Result<String> {
     let mut opts = config.options.clone();
     opts.num_ctx = opts.num_ctx.min(1024);
     opts.num_predict = 128;
