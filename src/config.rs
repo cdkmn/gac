@@ -15,7 +15,7 @@ pub struct OllamaOptions {
 impl Default for OllamaOptions {
     fn default() -> Self {
         Self {
-            num_ctx: 2048,
+            num_ctx: 4096,
             num_predict: 256,
             temperature: 0.2,
             top_p: 0.9,
@@ -62,6 +62,7 @@ struct ModelConfig {
     name: Option<String>,
     ollama_url: Option<String>,
     think: Option<bool>,
+    total_vram: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -80,6 +81,7 @@ struct FileConfig {
 }
 
 // ── Resolved config ───────────────────────────────────────────────────────
+#[derive(Clone)]
 pub struct Config {
     pub model: String,
     pub ollama_url: String,
@@ -89,6 +91,8 @@ pub struct Config {
     pub exclude_patterns: Vec<String>,
     /// All scopes defined in `.gac.toml`, keyed by name.
     pub scopes: HashMap<String, ScopeEntry>,
+    /// Total VRAM in bytes for stats display (0 = auto-detect).
+    pub total_vram: u64,
 }
 
 impl Default for Config {
@@ -101,6 +105,7 @@ impl Default for Config {
             max_diff_chars: 6000,
             exclude_patterns: default_excludes(),
             scopes: HashMap::new(),
+            total_vram: 0, // 0 = auto-detect via /api/ps
         }
     }
 }
@@ -177,6 +182,10 @@ impl Config {
 
             if let Some(v) = m.think {
                 self.think = v;
+            }
+
+            if let Some(v) = m.total_vram {
+                self.total_vram = v;
             }
         }
 

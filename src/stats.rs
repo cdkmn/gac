@@ -1,5 +1,4 @@
 // ── Raw stats captured from Ollama ────────────────────────────────────────
-static TOTAL_VRAM: f64 = 8_489_271_296.0;
 
 /// Token and timing stats from the final `/api/chat` done-chunk.
 #[derive(Debug, Default)]
@@ -31,7 +30,7 @@ impl GenerationStats {
 
     // ── Display ────────────────────────────────────────────────────────────
 
-    pub fn print(&self) {
+    pub fn print(&self, total_vram: u64) {
         use dialoguer::console::style;
 
         eprintln!(
@@ -74,8 +73,17 @@ impl GenerationStats {
         match self.vram_bytes {
             Some(used) => {
                 let used_mb = used as f64 / 1_048_576.0;
-                let total_mb = TOTAL_VRAM / 1_048_576.0;
-                let pct = (used as f64 / TOTAL_VRAM) * 100.0;
+                let total_mb = if total_vram > 0 {
+                    total_vram as f64 / 1_048_576.0
+                } else {
+                    // Fallback: estimate from model size
+                    used_mb * 1.2
+                };
+                let pct = if total_vram > 0 {
+                    (used as f64 / total_vram as f64) * 100.0
+                } else {
+                    (used_mb / (used_mb * 1.2)) * 100.0
+                };
                 let bar = vram_bar(pct, 20);
                 eprintln!(
                     "  {:20} {} [{bar}] {:.0}%",
