@@ -76,3 +76,24 @@ pub fn build_file_summary_prompt(path: &str, diff: &str) -> Prompt {
         user: summary_user(path, diff),
     }
 }
+
+// ── Retry prompt for validation failures ──────────────────────────────────
+
+/// Build a prompt that asks the model to retry after a validation failure.
+pub fn build_retry_prompt(
+    context: &str,
+    scope_candidates: &[&str],
+    original: &str,
+    error: &str,
+) -> Prompt {
+    let system = commit_system(scope_candidates);
+    let user = format!(
+        "Your previous response did not conform to the required format.\n\
+         Error: {error}\n\
+         Your response was:\n{original}\n\n\
+         Please try again and output ONLY a valid conventional commit message.\n\n\
+         Diff context:\n{context}"
+    );
+
+    Prompt { system, user }
+}
