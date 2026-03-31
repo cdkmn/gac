@@ -23,7 +23,7 @@ exclude_patterns = [
   "*.lock",
 ]
 [scopes.agents]
-paths = [".agents/**"]
+paths = [".agents/**", ".claude/**"]
 [scopes.config]
 paths = ["src/config.rs"]
 [scopes.diff]
