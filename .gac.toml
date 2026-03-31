@@ -5,7 +5,7 @@ ollama_url = "http://localhost:11434"
 think = false
 
 [options]
-num_ctx = 2048
+num_ctx = 4096
 num_predict = 256
 temperature = 0.2
 top_p = 0.9
