@@ -6,11 +6,13 @@ mod ollama;
 mod prompt;
 mod spinner;
 mod stats;
+mod validate;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
 use diff::Strategy;
+use futures_util::stream::{self, StreamExt};
 use logging::LogLevel;
 use std::{collections::HashMap, path::Path};
 use tracing::{debug, info, warn};
@@ -55,6 +57,10 @@ struct Cli {
     /// Suppress all output except the commit message and errors
     #[arg(short, long, conflicts_with = "verbose", conflicts_with = "debug")]
     quiet: bool,
+
+    /// Print the generated message to stdout and exit without committing
+    #[arg(long)]
+    print: bool,
 }
 
 fn init_config() -> Result<()> {
@@ -102,7 +108,7 @@ fn approval_dialog(message: &str) -> anyhow::Result<Approval> {
     match selection {
         Some(0) => Ok(Approval::Commit),
         Some(1) => {
-            // Open nvim pre-filled with the generated message.
+            // Open $EDITOR pre-filled with the generated message.
             // dialoguer::Editor returns None if the user saves an empty file.
             let edited = Editor::new()
                 .executable("nvim")
@@ -152,6 +158,9 @@ async fn main() -> Result<()> {
 
     // ── Shared MultiProgress — all spinners/bars share one instance ───────
     let mp = spinner::multi();
+
+    // ── HTTP client (reused across all API calls) ─────────────────────────
+    let client = ollama::create_client();
 
     // ── Config ────────────────────────────────────────────────────────────
     let mut config = Config::load()?;
@@ -220,51 +229,55 @@ async fn main() -> Result<()> {
             format!("=== Stat ===\n{stat}\n=== Diff ===\n{body}")
         }
         Strategy::Summarize => {
-            info!(files = file_diffs.len(), "summarizing files individually");
+            info!(
+                files = file_diffs.len(),
+                "summarizing files individually (parallel)"
+            );
 
             // One shared progress bar for the whole summarize pass
             let bar = spinner::summarize_bar(&mp, file_diffs.len());
+
+            // Prepare all tasks
+            let tasks: Vec<_> = file_diffs
+                .iter()
+                .map(|fd| {
+                    let client = client.clone();
+                    let config = config.clone();
+                    let fd = fd.clone();
+                    async move {
+                        let chunk = if fd.char_count > config.max_diff_chars / 2 {
+                            format!(
+                                "{}\n[... truncated ...]",
+                                &fd.content[..config.max_diff_chars / 2]
+                            )
+                        } else {
+                            fd.content.clone()
+                        };
+
+                        let p = prompt::build_file_summary_prompt(&fd.path, &chunk);
+                        let result = ollama::summarize(&client, &config, &p).await;
+                        (fd.path.clone(), result)
+                    }
+                })
+                .collect();
+
+            // Run with bounded concurrency (3 parallel API calls)
             let mut summaries: HashMap<String, String> = HashMap::new();
+            let mut stream = stream::iter(tasks).buffer_unordered(3);
+            let mut completed = 0u64;
 
-            for (i, fd) in file_diffs.iter().enumerate() {
-                bar.set_message(fd.path.clone());
-                bar.set_position(i as u64);
+            while let Some((path, result)) = stream.next().await {
+                completed += 1;
+                bar.set_position(completed);
 
-                debug!(
-                    path     = %fd.path,
-                    chars    = fd.char_count,
-                    priority = fd.priority,
-                    "summarizing file"
-                );
-
-                let chunk = if fd.char_count > config.max_diff_chars / 2 {
-                    warn!(
-                        path     = %fd.path,
-                        original = fd.char_count,
-                        limit    = config.max_diff_chars / 2,
-                        "file diff truncated for summarization"
-                    );
-                    format!(
-                        "{}\n[... truncated ...]",
-                        &fd.content[..config.max_diff_chars / 2]
-                    )
-                } else {
-                    fd.content.clone()
-                };
-
-                let p = prompt::build_file_summary_prompt(&fd.path, &chunk);
-
-                match ollama::summarize(&config, &p).await {
+                match result {
                     Ok(s) => {
-                        debug!(path = %fd.path, summary = %s, "file summarized");
-                        summaries.insert(fd.path.clone(), s);
+                        debug!(path = %path, summary = %s, "file summarized");
+                        summaries.insert(path, s);
                     }
                     Err(e) => {
-                        warn!(path = %fd.path, error = %e, "file summarization failed");
-                        summaries.insert(
-                            fd.path.clone(),
-                            "(summary failed — see stat for details)".into(),
-                        );
+                        warn!(path = %path, error = %e, "file summarization failed");
+                        summaries.insert(path, "(summary failed — see stat for details)".into());
                     }
                 }
             }
@@ -299,44 +312,89 @@ async fn main() -> Result<()> {
 
     // mp is passed in so the generation spinner shares the same draw target
     // as any bars that were active during the summarize pass.
-    let (message, gen_stats) = ollama::generate_streaming(&config, &commit_prompt, &mp).await?;
+    let (mut message, gen_stats) =
+        ollama::generate_streaming(&client, &config, &commit_prompt, &mp).await?;
     // Print stats immediately after generation, before the approval dialog
-    gen_stats.print();
+    gen_stats.print(config.total_vram);
 
-    // ── Approval + commit ─────────────────────────────────────────────────
-    let final_message = match approval_dialog(&message)? {
-        Approval::Commit => {
-            debug!("user confirmed commit");
-            message
-        }
-        Approval::Edit(edited) => {
-            info!("user edited commit message");
-            // Show the edited message before committing
-            println!(
-                "\n{}\n{}\n{}",
-                dialoguer::console::style("── Edited commit message ──").dim(),
-                edited,
-                dialoguer::console::style("───────────────────────────").dim(),
-            );
+    // ── Validate and auto-retry if needed ─────────────────────────────────
+    const MAX_RETRIES: usize = 2;
+    let mut retries = 0;
 
-            // One final confirmation after editing so the user can't
-            // accidentally commit a half-finished message.
-            let confirmed =
-                dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                    .with_prompt("Commit with edited message?")
-                    .default(true)
-                    .interact()?;
+    loop {
+        match validate::validate_conventional_commit(&message) {
+            Ok(()) => break,
+            Err(reason) if retries < MAX_RETRIES => {
+                retries += 1;
+                warn!(
+                    reason,
+                    retry = retries,
+                    "commit message validation failed — retrying"
+                );
 
-            if confirmed {
-                edited
-            } else {
-                info!("user aborted after edit");
-                return Ok(());
+                let retry_prompt =
+                    prompt::build_retry_prompt(&context, &candidates, &message, &reason);
+                let (retry_msg, _) =
+                    ollama::generate_streaming(&client, &config, &retry_prompt, &mp).await?;
+                message = retry_msg;
+            }
+            Err(reason) => {
+                warn!(
+                    reason,
+                    "commit message validation failed after retries — attempting auto-fix"
+                );
+                let fixed = validate::try_fix_commit_message(&message);
+                if validate::validate_conventional_commit(&fixed).is_ok() {
+                    info!("auto-fix succeeded");
+                    message = fixed;
+                } else {
+                    warn!("auto-fix failed — user will need to edit manually");
+                }
+                break;
             }
         }
-        Approval::Abort => {
-            info!("user aborted");
-            return Ok(());
+    }
+
+    // ── Approval + commit ─────────────────────────────────────────────────
+    let final_message = if cli.print {
+        // Print-only mode: output to stdout and exit
+        println!("{message}");
+        return Ok(());
+    } else {
+        match approval_dialog(&message)? {
+            Approval::Commit => {
+                debug!("user confirmed commit");
+                message
+            }
+            Approval::Edit(edited) => {
+                info!("user edited commit message");
+                // Show the edited message before committing
+                println!(
+                    "\n{}\n{}\n{}",
+                    dialoguer::console::style("── Edited commit message ──").dim(),
+                    edited,
+                    dialoguer::console::style("───────────────────────────").dim(),
+                );
+
+                // One final confirmation after editing so the user can't
+                // accidentally commit a half-finished message.
+                let confirmed =
+                    dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                        .with_prompt("Commit with edited message?")
+                        .default(true)
+                        .interact()?;
+
+                if confirmed {
+                    edited
+                } else {
+                    info!("user aborted after edit");
+                    return Ok(());
+                }
+            }
+            Approval::Abort => {
+                info!("user aborted");
+                return Ok(());
+            }
         }
     };
 
