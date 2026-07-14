@@ -1,4 +1,25 @@
+use std::sync::OnceLock;
 use tracing::{debug, warn};
+
+fn conventional_pattern() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?: .{1,120}$",
+        )
+        .expect("valid regex")
+    })
+}
+
+fn type_with_scope_pattern() -> &'static regex::Regex {
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        regex::Regex::new(
+            r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?$",
+        )
+        .expect("valid regex")
+    })
+}
 
 /// Validates that a commit message conforms to the Conventional Commits specification.
 ///
@@ -15,12 +36,7 @@ pub fn validate_conventional_commit(message: &str) -> Result<(), String> {
 
     // Conventional commit regex: type(scope): subject
     // type is required, scope is optional
-    let conventional_pattern = regex::Regex::new(
-        r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?: .{1,120}$",
-    )
-    .expect("valid regex");
-
-    if !conventional_pattern.is_match(first_line) {
+    if !conventional_pattern().is_match(first_line) {
         // Provide specific feedback about what's wrong
         if !first_line.contains(": ") {
             return Err(
@@ -31,13 +47,7 @@ pub fn validate_conventional_commit(message: &str) -> Result<(), String> {
         let parts: Vec<&str> = first_line.splitn(2, ": ").collect();
         let type_part = parts[0];
 
-        // Check if type is valid (with or without scope)
-        let type_with_scope = regex::Regex::new(
-            r"^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\([^)]+\))?$",
-        )
-        .expect("valid regex");
-
-        if !type_with_scope.is_match(type_part) {
+        if !type_with_scope_pattern().is_match(type_part) {
             return Err(format!(
                 "Invalid type '{type_part}'. Allowed: feat, fix, docs, style, refactor, perf, test, build, ci, chore, revert"
             ));
