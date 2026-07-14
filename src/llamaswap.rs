@@ -250,12 +250,16 @@ pub async fn generate_streaming(
     let mut result = String::new();
     let mut stats = GenerationStats::default();
     let mut first_token = true;
+    let mut line_buffer = String::new();
 
     while let Some(chunk) = stream.next().await {
         let bytes = chunk?;
+        line_buffer.push_str(&String::from_utf8_lossy(&bytes));
 
-        for line in String::from_utf8_lossy(&bytes).lines() {
-            let line = line.trim();
+        // Process all complete lines; leave any trailing partial line in the buffer.
+        while let Some(newline_pos) = line_buffer.find('\n') {
+            let line = line_buffer[..newline_pos].trim().to_string();
+            line_buffer.drain(..=newline_pos);
 
             if line.is_empty() {
                 continue;
@@ -283,7 +287,7 @@ pub async fn generate_streaming(
                 }
                 match choice.finish_reason {
                     None => {
-                        result.push_str(choice.delta.content.unwrap_or("".to_string()).as_str());
+                        result.push_str(choice.delta.content.unwrap_or_default().as_str());
                     }
                     _ => {
                         if let Some(timings) = &parsed.timings {
@@ -438,14 +442,10 @@ pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Res
     .await?;
 
     let body: ChatResponse = response.json().await?;
-    let content = body
-        .choices
-        .first()
-        .unwrap()
-        .message
-        .content
-        .as_ref()
-        .unwrap()
+    let choice = body.choices.first()
+        .ok_or_else(|| anyhow::anyhow!("API returned empty choices array"))?;
+    let content = choice.message.content.as_ref()
+        .ok_or_else(|| anyhow::anyhow!("API returned choice with null content"))?
         .trim()
         .to_string();
     Ok(content)
