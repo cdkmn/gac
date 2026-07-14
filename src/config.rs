@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{bail, Result};
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf};
 use tracing::{debug, info};
@@ -175,5 +175,35 @@ impl Config {
         if let Some(m) = model {
             self.model = m;
         }
+    }
+
+    /// Validate the resolved config. Call after loading and applying CLI overrides.
+    pub fn validate(&self) -> Result<()> {
+        if self.model.is_empty() {
+            bail!("model name is empty — set it in .gac.toml or via --model");
+        }
+
+        if self.max_completion_tokens == 0 {
+            bail!("max_completion_tokens must be > 0 (got 0)");
+        }
+
+        // Validate endpoint looks like a URL with a scheme
+        let ep = self.endpoint.trim();
+        if !ep.starts_with("http://") && !ep.starts_with("https://") {
+            bail!(
+                "endpoint '{}' must start with http:// or https://",
+                ep
+            );
+        }
+
+        // Reject trailing slashes that often come from copy-paste
+        if ep.ends_with('/') {
+            bail!(
+                "endpoint '{}' has a trailing slash — remove it",
+                ep
+            );
+        }
+
+        Ok(())
     }
 }
