@@ -3,7 +3,7 @@
 # llama-swap base url
 endpoint = "http://localhost:11438"
 
-# Model name for generaion
+# Model name for generation
 model = "Gemma-4:E4B-QAT"
 
 # An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens
@@ -20,7 +20,7 @@ exclude_patterns = [
   "*.lock",
 ]
 
-# Scope definations
+# Scope definitions
 [scopes.agents]
 paths = [".agents/**", ".claude/**"]
 
