@@ -1,6 +1,6 @@
 # gac — AI-Powered Commit Message Generator
 
-A CLI tool that generates meaningful commit messages using Ollama. It analyzes your staged git changes and produces conventional commit messages, handling large diffs intelligently through different strategies.
+A CLI tool that generates meaningful commit messages using llama.cpp over llama-swap. It analyzes your staged git changes and produces conventional commit messages, handling large diffs intelligently through different strategies.
 
 ## Purpose
 
@@ -17,7 +17,7 @@ A CLI tool that generates meaningful commit messages using Ollama. It analyzes y
 ### Prerequisites
 
 - Rust 1.70+ ([install via rustup](https://rustup.rs/))
-- [Ollama](https://ollama.ai/) installed and running locally
+- [llama-swap](https://github.com/mostlygeek/llama-swap) installed and running locally
 
 ### Build from Source
 
@@ -91,7 +91,7 @@ Create this file in your project root:
 ```toml
 [model]
 name = "cogito:8b"
-ollama_url = "http://localhost:11434"
+endpoint = "http://localhost:11434"
 think = false
 
 [options]
@@ -200,7 +200,7 @@ cargo CI
 
 ### Project Structure
 
-```
+```text
 gac/
 ├── src/
 │   ├── main.rs      # Entry point, CLI parsing, orchestration
@@ -238,7 +238,7 @@ gac/
 
 Generated messages follow [Conventional Commits](https://www.conventionalcommits.org/):
 
-```
+```text
 <type>(<scope>): <subject>
 
 [optional body]
