@@ -7,7 +7,7 @@ use tracing::{debug, info, warn};
 
 use crate::{config::Config, prompt::Prompt, spinner, stats::GenerationStats};
 
-const MAX_RETRIES: usize = 2;
+const MAX_API_RETRIES: usize = 2;
 const INITIAL_RETRY_DELAY_MS: u64 = 1000;
 
 #[derive(Serialize, Clone)]
@@ -169,15 +169,19 @@ fn build_messages(prompt: &Prompt) -> Vec<Message> {
 async fn check_response(response: reqwest::Response) -> Result<reqwest::Response> {
     if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .unwrap_or_else(|e| format!("(failed to read response body: {e})"));
         anyhow::bail!("API error {status}: {body}");
     }
 
     Ok(response)
 }
 
-async fn query_vram(base_url: &str, now: String) -> Option<PerfGpuStat> {
-    let Ok(resp) = reqwest::get(format!("{base_url}/api/performance?after={now}")).await else {
+async fn query_vram(client: &Client, endpoint: &str, now: String) -> Option<PerfGpuStat> {
+    let url = format!("{endpoint}/api/performance?after={now}");
+    let Ok(resp) = client.get(&url).send().await else {
         warn!("could not reach /api/performance — VRAM stats unavailable");
         return None;
     };
@@ -202,7 +206,7 @@ where
     loop {
         match operation().await {
             Ok(result) => return Ok(result),
-            Err(e) if attempt < MAX_RETRIES => {
+            Err(e) if attempt < MAX_API_RETRIES => {
                 attempt += 1;
                 let delay_ms = INITIAL_RETRY_DELAY_MS * 2u64.pow(attempt as u32 - 1);
                 warn!(attempt, delay_ms, error = %e, "API call failed — retrying");
@@ -321,7 +325,7 @@ pub async fn generate_streaming(
 
     // VRAM query after streaming — best-effort, never blocks the happy path
     let vram_spin = spinner::step_spinner(mp, "querying VRAM usage…");
-    let gpu_stat = query_vram(&config.endpoint, now).await;
+    let gpu_stat = query_vram(client, &config.endpoint, now).await;
     spinner::clear(&vram_spin);
 
     if let Some(gpu_stat) = gpu_stat {
@@ -378,10 +382,12 @@ pub async fn apply_template(client: &Client, config: &Config, prompt: &Prompt) -
 }
 
 /// Tokenize a string into token IDs using the model's tokenizer.
-pub async fn tokenize(client: &Client, config: &Config, content: String) -> Result<Vec<u32>> {
+pub async fn tokenize(client: &Client, config: &Config, content: &str) -> Result<Vec<u32>> {
     debug!(model= %config.model,"sending tokenize request");
 
-    let req = TokenizeRequest { content };
+    let req = TokenizeRequest {
+        content: content.to_string(),
+    };
     let response = check_response(
         client
             .post(format!(
@@ -399,10 +405,12 @@ pub async fn tokenize(client: &Client, config: &Config, content: String) -> Resu
 }
 
 /// Convert token IDs back to text using the model's tokenizer.
-pub async fn detokenize(client: &Client, config: &Config, tokens: Vec<u32>) -> Result<String> {
+pub async fn detokenize(client: &Client, config: &Config, tokens: &[u32]) -> Result<String> {
     debug!(model= %config.model,"sending detokenize request");
 
-    let req = DetokenizeRequest { tokens };
+    let req = DetokenizeRequest {
+        tokens: tokens.to_vec(),
+    };
     let response = check_response(
         client
             .post(format!(
@@ -422,7 +430,7 @@ pub async fn detokenize(client: &Client, config: &Config, tokens: Vec<u32>) -> R
 /// Count the number of tokens in a prompt (apply template then tokenize).
 pub async fn token_counts(client: &Client, config: &Config, prompt: &Prompt) -> Result<usize> {
     let content = apply_template(client, config, prompt).await?;
-    let tokens = tokenize(client, config, content).await?;
+    let tokens = tokenize(client, config, &content).await?;
     Ok(tokens.len())
 }
 
@@ -467,4 +475,115 @@ pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Res
         .trim()
         .to_string();
     Ok(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_for_debug ────────────────────────────────────────────────
+
+    #[test]
+    fn truncate_short_string_unchanged() {
+        assert_eq!(truncate_for_debug("hi"), "hi");
+    }
+
+    #[test]
+    fn truncate_long_string_is_limited() {
+        let long = "a".repeat(100);
+        let result = truncate_for_debug(&long);
+        assert_eq!(result.len(), 30);
+        assert_eq!(result, "a".repeat(30));
+    }
+
+    // ── build_messages ───────────────────────────────────────────────────
+
+    #[test]
+    fn build_messages_creates_system_and_user() {
+        let prompt = Prompt {
+            system: "sys".into(),
+            user: "usr".into(),
+        };
+        let msgs = build_messages(&prompt);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].role, "system");
+        assert_eq!(msgs[0].content, "sys");
+        assert_eq!(msgs[1].role, "user");
+        assert_eq!(msgs[1].content, "usr");
+    }
+
+    // ── ChatChunk deserialization ─────────────────────────────────────────
+
+    #[test]
+    fn chat_chunk_deserialize_content_delta() {
+        let json =
+            r#"{"choices":[{"delta":{"content":"hello"},"finish_reason":null}],"timings":null}"#;
+        let chunk: ChatChunk = serde_json::from_str(json).unwrap();
+        assert_eq!(chunk.choices.len(), 1);
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hello"));
+        assert!(chunk.choices[0].finish_reason.is_none());
+        assert!(chunk.timings.is_none());
+    }
+
+    #[test]
+    fn chat_chunk_deserialize_with_timings() {
+        let json = r#"{"choices":[{"delta":{"content":null},"finish_reason":"stop"}],"timings":{"prompt_n":10,"prompt_ms":5.0,"predicted_n":20,"predicted_ms":10.0,"predicted_per_second":2.0}}"#;
+        let chunk: ChatChunk = serde_json::from_str(json).unwrap();
+        assert!(chunk.choices[0].delta.content.is_none());
+        assert!(chunk.choices[0].finish_reason.is_some());
+        let t = chunk.timings.unwrap();
+        assert_eq!(t.prompt_n, 10);
+        assert_eq!(t.predicted_n, 20);
+        assert!((t.predicted_per_second - 2.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn chat_chunk_deserialize_done_signal() {
+        let json = r#"{"choices":[],"timings":null}"#;
+        let chunk: ChatChunk = serde_json::from_str(json).unwrap();
+        assert!(chunk.choices.is_empty());
+    }
+
+    #[test]
+    fn chat_chunk_default_is_empty() {
+        let chunk = ChatChunk::default();
+        assert!(chunk.choices.is_empty());
+        assert!(chunk.timings.is_none());
+    }
+
+    // ── FinishReason deserialization ──────────────────────────────────────
+
+    #[test]
+    fn finish_reason_stop_deserializes() {
+        let json = r#""stop""#;
+        let reason: FinishReason = serde_json::from_str(json).unwrap();
+        assert!(matches!(reason, FinishReason::Stop));
+    }
+
+    #[test]
+    fn finish_reason_length_deserializes() {
+        let json = r#""length""#;
+        let reason: FinishReason = serde_json::from_str(json).unwrap();
+        assert!(matches!(reason, FinishReason::Length));
+    }
+
+    // ── ChatResponse deserialization ──────────────────────────────────────
+
+    #[test]
+    fn chat_response_with_content() {
+        let json = r#"{"choices":[{"message":{"content":"feat: add foo"}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.choices.len(), 1);
+        assert_eq!(
+            resp.choices[0].message.content.as_deref(),
+            Some("feat: add foo")
+        );
+    }
+
+    #[test]
+    fn chat_response_with_null_content() {
+        let json = r#"{"choices":[{"message":{"content":null}}]}"#;
+        let resp: ChatResponse = serde_json::from_str(json).unwrap();
+        assert!(resp.choices[0].message.content.is_none());
+    }
 }
