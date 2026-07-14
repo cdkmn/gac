@@ -1,18 +1,15 @@
 # gac config
-[model]
-name = "cogito:8b"
-ollama_url = "http://localhost:11434"
-think = false
 
-[options]
-num_ctx = 4096
-num_predict = 256
-temperature = 0.2
-top_p = 0.9
-num_gpu = 999
+# llama-swap base url
+endpoint = "http://localhost:11438"
 
-[diff]
-max_chars = 6000
+# Model name for generaion
+model = "Gemma-4:E4B-QAT"
+
+# An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens
+max_completion_tokens = 4096
+
+# Patterns for excluding files
 exclude_patterns = [
   "package-lock.json",
   "yarn.lock",
@@ -22,29 +19,43 @@ exclude_patterns = [
   "poetry.lock",
   "*.lock",
 ]
+
+# Scope definations
 [scopes.agents]
 paths = [".agents/**", ".claude/**"]
+
 [scopes.config]
 paths = ["src/config.rs"]
+
 [scopes.diff]
 paths = ["src/diff.rs"]
+
 [scopes.git]
 paths = ["src/git.rs"]
+
 [scopes.logging]
 paths = ["src/logging.rs"]
-[scopes.ollama]
-paths = ["src/ollama.rs"]
+
+[scopes.llama]
+paths = ["src/llamaswap.rs"]
+
 [scopes.prompt]
 paths = ["src/prompt.rs"]
+
 [scopes.stats]
 paths = ["src/stats.rs"]
+
 [scopes.cli]
 paths = ["src/main.rs"]
+
 [scopes.core]
 paths = ["src/**"]
+
 [scopes.templates]
 paths = ["templates/**"]
+
 [scopes.deps]
 paths = ["Cargo.toml", "Cargo.lock"]
+
 [scopes.project]
 paths = ["./*"]
