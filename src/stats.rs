@@ -58,17 +58,24 @@ impl GenerationStats {
 
         // VRAM
         match self.vram_used_mb {
-            Some(used) => {
-                let total = self.vram_total_mb.unwrap();
-                let pct = self.vram_util_pct.unwrap();
-                let bar = vram_bar(pct, 20);
-                eprintln!(
-                    "  {:20} {} [{bar}] {:.0}%",
-                    style("VRAM").cyan().bold(),
-                    style(format!("{used:.0}/{total:.0} MB")).magenta(),
-                    pct,
-                );
-            }
+            Some(used) => match (self.vram_total_mb, self.vram_util_pct) {
+                (Some(total), Some(pct)) => {
+                    let bar = vram_bar(pct, 20);
+                    eprintln!(
+                        "  {:20} {} [{bar}] {:.0}%",
+                        style("VRAM").cyan().bold(),
+                        style(format!("{used:.0}/{total:.0} MB")).magenta(),
+                        pct,
+                    );
+                }
+                _ => {
+                    eprintln!(
+                        "  {:20} {}",
+                        style("VRAM").cyan().bold(),
+                        style(format!("{used:.0} MB used (total unknown)")).dim(),
+                    );
+                }
+            },
             _ => {
                 eprintln!(
                     "  {:20} {}",
