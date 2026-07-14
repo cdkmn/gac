@@ -364,8 +364,16 @@ index aaa..bbb 100644
     #[test]
     fn build_direct_context_concatenates_content() {
         let files = vec![
-            FileDiff { path: "a.rs".into(), priority: 90, content: "diff-a".into() },
-            FileDiff { path: "b.rs".into(), priority: 75, content: "diff-b".into() },
+            FileDiff {
+                path: "a.rs".into(),
+                priority: 90,
+                content: "diff-a".into(),
+            },
+            FileDiff {
+                path: "b.rs".into(),
+                priority: 75,
+                content: "diff-b".into(),
+            },
         ];
         let ctx = build_direct_context(&files);
         assert_eq!(ctx, "diff-a\ndiff-b\n");
@@ -401,9 +409,21 @@ index aaa..bbb 100644
     #[test]
     fn build_stat_context_includes_top_n_files() {
         let files = vec![
-            FileDiff { path: "a.rs".into(), priority: 90, content: "diff-a".into() },
-            FileDiff { path: "b.rs".into(), priority: 75, content: "diff-b".into() },
-            FileDiff { path: "c.rs".into(), priority: 50, content: "diff-c".into() },
+            FileDiff {
+                path: "a.rs".into(),
+                priority: 90,
+                content: "diff-a".into(),
+            },
+            FileDiff {
+                path: "b.rs".into(),
+                priority: 75,
+                content: "diff-b".into(),
+            },
+            FileDiff {
+                path: "c.rs".into(),
+                priority: 50,
+                content: "diff-c".into(),
+            },
         ];
         let ctx = build_stat_context("stat output", &files, 2);
         assert!(ctx.contains("diff-a"));
@@ -414,9 +434,11 @@ index aaa..bbb 100644
 
     #[test]
     fn build_stat_context_no_skipped_when_top_n_covers_all() {
-        let files = vec![
-            FileDiff { path: "a.rs".into(), priority: 90, content: "diff-a".into() },
-        ];
+        let files = vec![FileDiff {
+            path: "a.rs".into(),
+            priority: 90,
+            content: "diff-a".into(),
+        }];
         let ctx = build_stat_context("stat", &files, 5);
         assert!(!ctx.contains("omitted"));
     }
@@ -427,6 +449,9 @@ index aaa..bbb 100644
     fn strategy_display() {
         assert_eq!(Strategy::Direct.to_string(), "direct");
         assert_eq!(Strategy::Summarize.to_string(), "per-file summarize");
-        assert_eq!(Strategy::StatOnly { top_n: 3 }.to_string(), "stat + top-3 files");
+        assert_eq!(
+            Strategy::StatOnly { top_n: 3 }.to_string(),
+            "stat + top-3 files"
+        );
     }
 }

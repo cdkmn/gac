@@ -442,9 +442,14 @@ pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Res
     .await?;
 
     let body: ChatResponse = response.json().await?;
-    let choice = body.choices.first()
+    let choice = body
+        .choices
+        .first()
         .ok_or_else(|| anyhow::anyhow!("API returned empty choices array"))?;
-    let content = choice.message.content.as_ref()
+    let content = choice
+        .message
+        .content
+        .as_ref()
         .ok_or_else(|| anyhow::anyhow!("API returned choice with null content"))?
         .trim()
         .to_string();

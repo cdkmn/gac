@@ -190,18 +190,12 @@ impl Config {
         // Validate endpoint looks like a URL with a scheme
         let ep = self.endpoint.trim();
         if !ep.starts_with("http://") && !ep.starts_with("https://") {
-            bail!(
-                "endpoint '{}' must start with http:// or https://",
-                ep
-            );
+            bail!("endpoint '{}' must start with http:// or https://", ep);
         }
 
         // Reject trailing slashes that often come from copy-paste
         if ep.ends_with('/') {
-            bail!(
-                "endpoint '{}' has a trailing slash — remove it",
-                ep
-            );
+            bail!("endpoint '{}' has a trailing slash — remove it", ep);
         }
 
         Ok(())
