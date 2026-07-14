@@ -56,11 +56,11 @@ gac
 gac [OPTIONS]
 
 Options:
-  -m, --model <MODEL>       Override the Ollama model name
-  -c, --num-ctx <NUM_CTX>   Override context window size
+  -m, --model <MODEL>       Override the llama-swap model name
   -v, --verbose             Show info-level messages
       --debug               Show debug-level messages
   -q, --quiet               Suppress all output except errors
+      --print               Print generated message to stdout without committing
   init                      Create a .gac.toml config file
   -h, --help                Show help information
   -V, --version             Show version
@@ -72,14 +72,14 @@ Options:
 # Use a different model
 gac --model qwen2.5-coder:7b
 
-# Increase context window
-gac --num-ctx 4096
-
 # Verbose output for debugging
 gac --verbose
 
 # Quiet mode (errors only)
 gac --quiet
+
+# Print generated message to stdout without committing
+gac --print
 ```
 
 ## Configuration
@@ -89,20 +89,9 @@ gac --quiet
 Create this file in your project root:
 
 ```toml
-[model]
-name = "cogito:8b"
-endpoint = "http://localhost:11434"
-think = false
-
-[options]
-num_ctx = 2048
-num_predict = 256
-temperature = 0.2
-top_p = 0.9
-num_gpu = 999
-
-[diff]
-max_chars = 6000
+endpoint = "http://localhost:11438"
+model = "Gemma-4:E4B-QAT"
+max_completion_tokens = 4096
 exclude_patterns = [
     "package-lock.json",
     "yarn.lock",
@@ -111,6 +100,7 @@ exclude_patterns = [
 
 [scopes.config]
 paths = ["src/config.rs"]
+
 [scopes.ui]
 paths = ["src/ui/**", "templates/**"]
 ```
@@ -129,7 +119,6 @@ paths = ["src/api/**", "src/routes/**"]
 
 [scopes.auth]
 paths = ["src/auth/**"]
-description = "Authentication & authorization"
 ```
 
 ## Diff Strategies
@@ -193,9 +182,6 @@ cargo clippy --all-targets -- -D warnings
 
 # Build documentation
 cargo doc
-
-# Run all checks (CI)
-cargo CI
 ```
 
 ### Project Structure
@@ -203,17 +189,19 @@ cargo CI
 ```text
 gac/
 ├── src/
-│   ├── main.rs      # Entry point, CLI parsing, orchestration
-│   ├── config.rs    # Config loading (.gac.toml)
-│   ├── diff.rs      # Git diff parsing and strategy selection
-│   ├── git.rs       # Git operations (staged files, scopes)
-│   ├── logging.rs   # Custom CLI logging formatter
-│   ├── ollama.rs    # Ollama API client
-│   ├── prompt.rs    # Prompt building with Askama templates
-│   └── stats.rs     # Generation stats display
-├── templates/       # Askama templates for prompts
+│   ├── main.rs       # Entry point, CLI parsing, orchestration
+│   ├── config.rs     # Config loading (.gac.toml), scope definitions
+│   ├── diff.rs       # Git diff parsing, priority scoring, strategy selection
+│   ├── git.rs        # Git operations (staged files, scopes, excludes)
+│   ├── logging.rs    # Custom CLI logging formatter
+│   ├── llamaswap.rs  # llama-swap API client (streaming, tokenize/detokenize, retry)
+│   ├── prompt.rs     # Prompt building with Askama templates
+│   ├── spinner.rs    # Progress spinners/bars (indicatif)
+│   ├── stats.rs      # Generation stats display (tokens, VRAM, timing)
+│   └── validate.rs   # Conventional commit validation + auto-fix
+├── templates/        # Askama templates for prompts (.md extension)
 ├── Cargo.toml
-└── .gac.toml       # Example config
+└── .gac.toml         # Project config
 ```
 
 ### Key Dependencies
@@ -221,10 +209,11 @@ gac/
 - **clap** — CLI argument parsing
 - **anyhow** — Error handling
 - **tokio** — Async runtime
-- **reqwest** — HTTP client for Ollama API
+- **reqwest** — HTTP client for llama-swap API
 - **tracing** — Structured logging
 - **askama** — Template engine for prompts
 - **dialoguer** — Interactive prompts
+- **indicatif** — Progress spinners and bars
 
 ### Adding New Features
 
