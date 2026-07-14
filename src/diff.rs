@@ -157,7 +157,7 @@ pub async fn select_strategy(
     raw_diff: &str,
     scope_match: &ScopeMatch,
     stat: String,
-) -> Result<(Strategy, String), Box<dyn std::error::Error>> {
+) -> anyhow::Result<(Strategy, String)> {
     let props = llamaswap::model_props(client, config).await?;
     let mut budget = props.default_generation_settings.n_ctx;
     let files = parse_diff(raw_diff);
