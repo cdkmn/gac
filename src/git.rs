@@ -132,10 +132,18 @@ pub fn detect_scopes(staged_files: &[String], scopes: &HashMap<String, ScopeEntr
             continue;
         }
 
-        let compiled: Vec<Pattern> = patterns
-            .iter()
-            .filter_map(|p| Pattern::new(p).ok())
-            .collect();
+        let mut compiled = Vec::new();
+        for p in patterns {
+            match Pattern::new(p) {
+                Ok(pat) => compiled.push(pat),
+                Err(e) => warn!(
+                    scope = %name,
+                    pattern = %p,
+                    error = %e,
+                    "invalid glob pattern in scope definition — skipped"
+                ),
+            }
+        }
 
         let hits = staged_files
             .iter()
