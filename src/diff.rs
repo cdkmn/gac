@@ -63,12 +63,13 @@ impl std::fmt::Display for Strategy {
 }
 
 /// Score a file path 0-100.
-pub fn score_file(path: &str) -> u8 {
-    let name = std::path::Path::new(path)
+fn score_file(path: &str) -> u8 {
+    let path_buf = std::path::Path::new(path);
+    let name = path_buf
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(path);
-    let ext = std::path::Path::new(path)
+    let ext = path_buf
         .extension()
         .and_then(|e| e.to_str())
         .unwrap_or("")
@@ -84,8 +85,11 @@ pub fn score_file(path: &str) -> u8 {
     }
 
     if HIGH_PRIORITY_EXT.contains(&ext.as_str()) {
-        // Bump source files inside src/ or lib/
-        if path.starts_with("src/") || path.starts_with("lib/") {
+        // Bump source files inside src/ or lib/ (use Path components for cross-platform)
+        let dominated = path_buf
+            .components()
+            .any(|c| matches!(c, std::path::Component::Normal(s) if s == "src" || s == "lib"));
+        if dominated {
             return 90;
         }
 
@@ -156,7 +160,7 @@ pub async fn select_strategy(
     config: &Config,
     raw_diff: &str,
     scope_match: &ScopeMatch,
-    stat: String,
+    stat: &str,
 ) -> anyhow::Result<(Strategy, String)> {
     let props = llamaswap::model_props(client, config).await?;
     let mut budget = props.default_generation_settings.n_ctx;
@@ -186,7 +190,7 @@ pub async fn select_strategy(
     let mut top_n = 0;
 
     for f in files {
-        let tokens = llamaswap::tokenize(client, config, f.content.clone()).await?;
+        let tokens = llamaswap::tokenize(client, config, &f.content).await?;
 
         if tokens.len() > budget as usize {
             break;
@@ -208,7 +212,7 @@ pub async fn select_strategy(
 
 /// Build a direct diff string from the sorted file list.
 /// Only used by `Strategy::Direct` (guaranteed to fit).
-pub fn build_direct_context(files: &[FileDiff]) -> String {
+fn build_direct_context(files: &[FileDiff]) -> String {
     let mut out = String::new();
 
     for f in files {
@@ -272,6 +276,13 @@ mod tests {
         assert_eq!(score_file("src/main.rs"), 90);
         assert_eq!(score_file("src/auth/jwt.ts"), 90);
         assert_eq!(score_file("lib/utils.py"), 90);
+    }
+
+    #[test]
+    fn score_source_in_src_windows_separators() {
+        assert_eq!(score_file("src\\main.rs"), 90);
+        assert_eq!(score_file("src\\auth\\jwt.ts"), 90);
+        assert_eq!(score_file("lib\\utils.py"), 90);
     }
 
     #[test]
