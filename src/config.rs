@@ -1,28 +1,7 @@
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf};
 use tracing::{debug, info};
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OllamaOptions {
-    pub num_ctx: u32,
-    pub num_predict: u32,
-    pub temperature: f32,
-    pub top_p: f32,
-    pub num_gpu: i32,
-}
-
-impl Default for OllamaOptions {
-    fn default() -> Self {
-        Self {
-            num_ctx: 4096,
-            num_predict: 256,
-            temperature: 0.2,
-            top_p: 0.9,
-            num_gpu: 999,
-        }
-    }
-}
 
 // ── Scope definition ──────────────────────────────────────────────────────
 /// A single named scope with optional glob patterns to auto-detect it.
@@ -57,25 +36,17 @@ impl ScopeEntry {
 }
 
 // ── TOML file layout ──────────────────────────────────────────────────────
-#[derive(Debug, Deserialize)]
-struct ModelConfig {
-    name: Option<String>,
-    ollama_url: Option<String>,
-    think: Option<bool>,
-    total_vram: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DiffConfig {
-    max_chars: Option<usize>,
-    exclude_patterns: Option<Vec<String>>,
-}
 
 #[derive(Debug, Deserialize, Default)]
 struct FileConfig {
-    model: Option<ModelConfig>,
-    options: Option<OllamaOptions>,
-    diff: Option<DiffConfig>,
+    /// llama-swap URL
+    endpoint: Option<String>,
+    /// Model name
+    model: Option<String>,
+    /// An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens.
+    max_completion_tokens: Option<u64>,
+    /// Patterns for excluding files
+    exclude_patterns: Option<Vec<String>>,
     /// `[scopes]` table: scope name → entry
     scopes: Option<HashMap<String, ScopeEntry>>,
 }
@@ -83,29 +54,26 @@ struct FileConfig {
 // ── Resolved config ───────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct Config {
+    /// LLM name
     pub model: String,
-    pub ollama_url: String,
-    pub think: bool,
-    pub options: OllamaOptions,
-    pub max_diff_chars: usize,
+    /// llama-swap base url
+    pub endpoint: String,
+    /// An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens.
+    pub max_completion_tokens: u64,
+    /// Excluded file patterns
     pub exclude_patterns: Vec<String>,
     /// All scopes defined in `.gac.toml`, keyed by name.
     pub scopes: HashMap<String, ScopeEntry>,
-    /// Total VRAM in bytes for stats display (0 = auto-detect).
-    pub total_vram: u64,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            model: "cogito:8b".to_string(),
-            ollama_url: "http://localhost:11434".to_string(),
-            think: false,
-            options: OllamaOptions::default(),
-            max_diff_chars: 6000,
+            model: "Gemma-4:E4B-QAT".to_string(),
+            endpoint: "http://localhost:11438".to_string(),
+            max_completion_tokens: 4096,
             exclude_patterns: default_excludes(),
             scopes: HashMap::new(),
-            total_vram: 0, // 0 = auto-detect via /api/ps
         }
     }
 }
@@ -172,35 +140,19 @@ impl Config {
             .map_err(|e| anyhow::anyhow!("Invalid config at {}: {}", path.display(), e))?;
 
         if let Some(m) = file.model {
-            if let Some(v) = m.name {
-                self.model = v;
-            }
-
-            if let Some(v) = m.ollama_url {
-                self.ollama_url = v;
-            }
-
-            if let Some(v) = m.think {
-                self.think = v;
-            }
-
-            if let Some(v) = m.total_vram {
-                self.total_vram = v;
-            }
+            self.model = m;
         }
 
-        if let Some(o) = file.options {
-            self.options = o;
+        if let Some(e) = file.endpoint {
+            self.endpoint = e;
         }
 
-        if let Some(d) = file.diff {
-            if let Some(v) = d.max_chars {
-                self.max_diff_chars = v;
-            }
+        if let Some(e) = file.max_completion_tokens {
+            self.max_completion_tokens = e;
+        }
 
-            if let Some(v) = d.exclude_patterns {
-                self.exclude_patterns = v;
-            }
+        if let Some(v) = file.exclude_patterns {
+            self.exclude_patterns = v;
         }
 
         // Scopes: project file REPLACES user-level scopes entirely so there
@@ -210,23 +162,18 @@ impl Config {
         }
 
         debug!(
-            model       = %self.model,
-            num_ctx     = self.options.num_ctx,
-            max_chars   = self.max_diff_chars,
-            scopes      = self.scopes.len(),
+            model = %self.model,
+            max_completion_tokens = self.max_completion_tokens,
+            scopes = self.scopes.len(),
             "config resolved"
         );
 
         Ok(())
     }
 
-    pub fn apply_cli_overrides(&mut self, model: Option<String>, num_ctx: Option<u32>) {
+    pub fn apply_cli_overrides(&mut self, model: Option<String>) {
         if let Some(m) = model {
             self.model = m;
-        }
-
-        if let Some(c) = num_ctx {
-            self.options.num_ctx = c;
         }
     }
 }
