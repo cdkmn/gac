@@ -1,8 +1,8 @@
 mod config;
 mod diff;
 mod git;
+mod llamaswap;
 mod logging;
-mod ollama;
 mod prompt;
 mod spinner;
 mod stats;
@@ -12,7 +12,6 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use config::Config;
 use diff::Strategy;
-use futures_util::stream::{self, StreamExt};
 use logging::LogLevel;
 use std::{collections::HashMap, path::Path};
 use tracing::{debug, info, warn};
@@ -33,7 +32,7 @@ enum Approval {
 #[derive(Parser)]
 #[command(
     name = "gac",
-    about = "AI commit message generator — Ollama, low-VRAM",
+    about = "AI commit message generator — llama-swap, low-VRAM",
     version
 )]
 struct Cli {
@@ -42,9 +41,6 @@ struct Cli {
 
     #[arg(short, long)]
     model: Option<String>,
-
-    #[arg(long)]
-    num_ctx: Option<u32>,
 
     /// Show info-level messages: config paths, strategy selection, scope detection
     #[arg(short, long, conflicts_with = "debug")]
@@ -160,11 +156,11 @@ async fn main() -> Result<()> {
     let mp = spinner::multi();
 
     // ── HTTP client (reused across all API calls) ─────────────────────────
-    let client = ollama::create_client();
+    let client = llamaswap::create_client();
 
     // ── Config ────────────────────────────────────────────────────────────
     let mut config = Config::load()?;
-    config.apply_cli_overrides(cli.model, cli.num_ctx);
+    config.apply_cli_overrides(cli.model);
 
     // ── Staged files ──────────────────────────────────────────────────────
     let all_staged = git::get_staged_files();
@@ -210,9 +206,11 @@ async fn main() -> Result<()> {
                 .count()
         ),
     );
-    // ── Parse + score ─────────────────────────────────────────────────────
     let file_diffs = diff::parse_diff(&raw_diff);
-    let strategy = diff::select_strategy(&file_diffs, config.max_diff_chars);
+    let (strategy, ctx) =
+        diff::select_strategy(&client, &config, &raw_diff, &scope_match, stat.clone())
+            .await
+            .unwrap();
 
     info!(
         diff_chars = raw_diff.len(),
@@ -223,61 +221,52 @@ async fn main() -> Result<()> {
 
     // ── Build context via chosen strategy ─────────────────────────────────
     let context = match &strategy {
-        Strategy::Direct => {
-            debug!("using direct diff — fits within context budget");
-            let body = diff::build_direct_context(&file_diffs, config.max_diff_chars);
-            format!("=== Stat ===\n{stat}\n=== Diff ===\n{body}")
-        }
+        Strategy::Direct => ctx,
         Strategy::Summarize => {
-            info!(
-                files = file_diffs.len(),
-                "summarizing files individually (parallel)"
-            );
+            info!(files = file_diffs.len(), "summarizing files individually");
 
             // One shared progress bar for the whole summarize pass
             let bar = spinner::summarize_bar(&mp, file_diffs.len());
-
-            // Prepare all tasks
-            let tasks: Vec<_> = file_diffs
-                .iter()
-                .map(|fd| {
-                    let client = client.clone();
-                    let config = config.clone();
-                    let fd = fd.clone();
-                    async move {
-                        let chunk = if fd.char_count > config.max_diff_chars / 2 {
-                            format!(
-                                "{}\n[... truncated ...]",
-                                &fd.content[..config.max_diff_chars / 2]
-                            )
-                        } else {
-                            fd.content.clone()
-                        };
-
-                        let p = prompt::build_file_summary_prompt(&fd.path, &chunk);
-                        let result = ollama::summarize(&client, &config, &p).await;
-                        (fd.path.clone(), result)
-                    }
-                })
-                .collect();
-
-            // Run with bounded concurrency (3 parallel API calls)
+            let props = llamaswap::model_props(&client, &config).await.unwrap();
+            let budget = props.default_generation_settings.n_ctx;
             let mut summaries: HashMap<String, String> = HashMap::new();
-            let mut stream = stream::iter(tasks).buffer_unordered(3);
             let mut completed = 0u64;
 
-            while let Some((path, result)) = stream.next().await {
+            for fd in &file_diffs {
+                let tokens = llamaswap::tokenize(&client, &config, fd.content.clone())
+                    .await
+                    .unwrap();
+
+                let chunk = if tokens.len() > (budget / 2) as usize {
+                    let detokenized = llamaswap::detokenize(
+                        &client,
+                        &config,
+                        tokens[..(budget / 2) as usize].to_vec(),
+                    )
+                    .await
+                    .unwrap();
+                    format!("{}\n[... truncated ...]", detokenized)
+                } else {
+                    fd.content.clone()
+                };
+
+                let p = prompt::build_file_summary_prompt(&fd.path, &chunk);
+                let result = llamaswap::summarize(&client, &config, &p).await;
+
                 completed += 1;
                 bar.set_position(completed);
 
                 match result {
                     Ok(s) => {
-                        debug!(path = %path, summary = %s, "file summarized");
-                        summaries.insert(path, s);
+                        debug!(path = %fd.path, summary = %s, "file summarized");
+                        summaries.insert(fd.path.clone(), s);
                     }
                     Err(e) => {
-                        warn!(path = %path, error = %e, "file summarization failed");
-                        summaries.insert(path, "(summary failed — see stat for details)".into());
+                        warn!(path = %fd.path, error = %e, "file summarization failed");
+                        summaries.insert(
+                            fd.path.clone(),
+                            "(summary failed — see stat for details)".into(),
+                        );
                     }
                 }
             }
@@ -306,16 +295,15 @@ async fn main() -> Result<()> {
 
     info!(
         model   = %config.model,
-        num_ctx = config.options.num_ctx,
         "generating commit message"
     );
 
     // mp is passed in so the generation spinner shares the same draw target
     // as any bars that were active during the summarize pass.
     let (mut message, gen_stats) =
-        ollama::generate_streaming(&client, &config, &commit_prompt, &mp).await?;
+        llamaswap::generate_streaming(&client, &config, &commit_prompt, &mp).await?;
     // Print stats immediately after generation, before the approval dialog
-    gen_stats.print(config.total_vram);
+    gen_stats.print();
 
     // ── Validate and auto-retry if needed ─────────────────────────────────
     const MAX_RETRIES: usize = 2;
@@ -335,7 +323,7 @@ async fn main() -> Result<()> {
                 let retry_prompt =
                     prompt::build_retry_prompt(&context, &candidates, &message, &reason);
                 let (retry_msg, _) =
-                    ollama::generate_streaming(&client, &config, &retry_prompt, &mp).await?;
+                    llamaswap::generate_streaming(&client, &config, &retry_prompt, &mp).await?;
                 message = retry_msg;
             }
             Err(reason) => {
