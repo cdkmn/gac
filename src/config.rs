@@ -85,9 +85,6 @@ fn default_excludes() -> Vec<String> {
         "bun.lockb".into(),
         "Cargo.lock".into(),
         "poetry.lock".into(),
-        "Gemfile.lock".into(),
-        "composer.lock".into(),
-        "go.sum".into(),
         "*.lock".into(),
     ]
 }
