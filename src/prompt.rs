@@ -26,8 +26,7 @@ struct ScopeTemplate<'a> {
 
 // ── Commit message generation ─────────────────────────────────────────────
 
-/// System prompt for the final commit generation pass.
-pub fn commit_system(scope_candidates: &[&str]) -> String {
+fn commit_system(scope_candidates: &[&str]) -> String {
     let scope_rule = match scope_candidates {
         [] => include_str!("../templates/empty_scope.md").to_string(),
         [single] => SingleScope { single }
@@ -45,9 +44,7 @@ pub fn commit_system(scope_candidates: &[&str]) -> String {
     .expect("failed to render commit system template")
 }
 
-/// User message for the final commit generation pass.
-/// Kept minimal — all rules live in the system prompt.
-pub fn commit_user(context: &str) -> String {
+fn commit_user(context: &str) -> String {
     format!("Please analyze the following diff and generate commit message based on the changes:\n\n{context}")
 }
 
@@ -60,17 +57,11 @@ pub fn build_commit_prompt(context: &str, scope_candidates: &[&str]) -> Prompt {
 
 // ── Per-file summarization ────────────────────────────────────────────────
 
-/// System prompt for the cheap per-file summarization pass.
-///
-/// Intentionally much shorter than the commit system prompt — this pass runs
-/// N times (once per file) and feeds into the commit pass, not the user.
-/// Precision and brevity matter more than style enforcement here.
-pub fn summary_system() -> &'static str {
+fn summary_system() -> &'static str {
     include_str!("../templates/summary_system.md")
 }
 
-/// User message for the per-file summarization pass.
-pub fn summary_user(path: &str, diff: &str) -> String {
+fn summary_user(path: &str, diff: &str) -> String {
     format!("Summarize the changes in `{path}`:\n\n{diff}")
 }
 
@@ -100,4 +91,111 @@ pub fn build_retry_prompt(
     );
 
     Prompt { system, user }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── commit_system ─────────────────────────────────────────────────────
+
+    #[test]
+    fn commit_system_no_candidates_includes_empty_scope_rule() {
+        let result = commit_system(&[]);
+        assert!(result.contains("Scope"));
+        // The empty_scope.md content should be present
+        assert!(
+            result.contains("Infer the most specific scope"),
+            "should contain empty scope inference rule"
+        );
+    }
+
+    #[test]
+    fn commit_system_single_candidate() {
+        let result = commit_system(&["auth"]);
+        assert!(result.contains("auth"));
+        assert!(result.contains("Scope"));
+    }
+
+    #[test]
+    fn commit_system_multiple_candidates() {
+        let result = commit_system(&["api", "auth", "db"]);
+        assert!(result.contains("api"));
+        assert!(result.contains("auth"));
+        assert!(result.contains("db"));
+        assert!(result.contains("Scope"));
+    }
+
+    #[test]
+    fn commit_system_contains_allowed_types() {
+        let result = commit_system(&[]);
+        assert!(result.contains("feat"));
+        assert!(result.contains("fix"));
+        assert!(result.contains("chore"));
+        assert!(result.contains("revert"));
+    }
+
+    // ── commit_user ───────────────────────────────────────────────────────
+
+    #[test]
+    fn commit_user_contains_context() {
+        let result = commit_user("diff content here");
+        assert!(result.contains("diff content here"));
+        assert!(result.contains("commit message"));
+    }
+
+    // ── build_commit_prompt ───────────────────────────────────────────────
+
+    #[test]
+    fn build_commit_prompt_has_system_and_user() {
+        let prompt = build_commit_prompt("some diff", &["api"]);
+        assert!(!prompt.system.is_empty());
+        assert!(prompt.user.contains("some diff"));
+        assert!(prompt.system.contains("api"));
+    }
+
+    // ── summary_system ────────────────────────────────────────────────────
+
+    #[test]
+    fn summary_system_returns_non_empty_static() {
+        let s = summary_system();
+        assert!(!s.is_empty());
+        assert!(s.contains("1-2 sentences"));
+    }
+
+    // ── summary_user ──────────────────────────────────────────────────────
+
+    #[test]
+    fn summary_user_contains_path_and_diff() {
+        let result = summary_user("src/main.rs", "+added\n-removed");
+        assert!(result.contains("src/main.rs"));
+        assert!(result.contains("+added"));
+        assert!(result.contains("-removed"));
+    }
+
+    // ── build_file_summary_prompt ─────────────────────────────────────────
+
+    #[test]
+    fn build_file_summary_prompt_has_system_and_user() {
+        let prompt = build_file_summary_prompt("src/lib.rs", "diff here");
+        assert!(!prompt.system.is_empty());
+        assert!(prompt.user.contains("src/lib.rs"));
+        assert!(prompt.user.contains("diff here"));
+    }
+
+    // ── build_retry_prompt ────────────────────────────────────────────────
+
+    #[test]
+    fn build_retry_prompt_includes_error_and_original() {
+        let prompt = build_retry_prompt(
+            "some diff",
+            &["feat"],
+            "update: stuff",
+            "Invalid type 'update'",
+        );
+        assert!(prompt.user.contains("Invalid type 'update'"));
+        assert!(prompt.user.contains("update: stuff"));
+        assert!(prompt.user.contains("some diff"));
+        assert!(prompt.system.contains("feat"));
+    }
 }
