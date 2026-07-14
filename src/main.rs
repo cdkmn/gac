@@ -59,6 +59,10 @@ struct Cli {
     /// Print the generated message to stdout and exit without committing
     #[arg(long)]
     print: bool,
+
+    /// Pass --no-verify to git commit (skip pre-commit hooks)
+    #[arg(long)]
+    no_verify: bool,
 }
 
 fn init_config() -> Result<()> {
@@ -214,10 +218,9 @@ async fn main() -> Result<()> {
         ),
     );
     let file_diffs = diff::parse_diff(&raw_diff);
-    let (strategy, ctx) =
-        diff::select_strategy(&client, &config, &raw_diff, &scope_match, stat.clone())
-            .await
-            .context("failed to select diff strategy")?;
+    let (strategy, ctx) = diff::select_strategy(&client, &config, &raw_diff, &scope_match, &stat)
+        .await
+        .context("failed to select diff strategy")?;
 
     info!(
         diff_chars = raw_diff.len(),
@@ -242,21 +245,18 @@ async fn main() -> Result<()> {
             let mut completed = 0u64;
 
             for fd in &file_diffs {
-                let tokens = llamaswap::tokenize(&client, &config, fd.content.clone())
+                let tokens = llamaswap::tokenize(&client, &config, &fd.content)
                     .await
                     .context("failed to tokenize file diff")?;
 
                 let chunk = if tokens.len() > (budget / 2) as usize {
-                    let detokenized = llamaswap::detokenize(
-                        &client,
-                        &config,
-                        tokens[..(budget / 2) as usize].to_vec(),
-                    )
-                    .await
-                    .context("failed to detokenize truncated diff")?;
+                    let detokenized =
+                        llamaswap::detokenize(&client, &config, &tokens[..(budget / 2) as usize])
+                            .await
+                            .context("failed to detokenize truncated diff")?;
                     format!("{}\n[... truncated ...]", detokenized)
                 } else {
-                    fd.content.clone()
+                    fd.content.to_owned()
                 };
 
                 let p = prompt::build_file_summary_prompt(&fd.path, &chunk);
@@ -315,13 +315,13 @@ async fn main() -> Result<()> {
     gen_stats.print();
 
     // ── Validate and auto-retry if needed ─────────────────────────────────
-    const MAX_RETRIES: usize = 2;
+    const MAX_VALIDATION_RETRIES: usize = 2;
     let mut retries = 0;
 
     loop {
         match validate::validate_conventional_commit(&message) {
             Ok(()) => break,
-            Err(reason) if retries < MAX_RETRIES => {
+            Err(reason) if retries < MAX_VALIDATION_RETRIES => {
                 retries += 1;
                 warn!(
                     reason,
@@ -397,7 +397,7 @@ async fn main() -> Result<()> {
     };
 
     debug!(message = %final_message, "running git commit");
-    if git::commit(&final_message)? {
+    if git::commit(&final_message, cli.no_verify)? {
         info!("committed successfully");
     } else {
         anyhow::bail!("git commit failed");
