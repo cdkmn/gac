@@ -316,6 +316,7 @@ async fn main() -> Result<()> {
                 retries += 1;
                 warn!(
                     reason,
+                    message = &message,
                     retry = retries,
                     "commit message validation failed — retrying"
                 );
