@@ -11,16 +11,15 @@ use tracing::{debug, info};
 ///   [scopes.api]                          # patterns only
 ///   paths = ["src/api/**", "src/routes/**"]
 ///
-///   [scopes.auth]                         # patterns + description
-///   paths       = ["src/auth/**"]
-///   description = "Authentication & authorization"
+///   [scopes.auth]                         # full form
+///   paths = ["src/auth/**"]
 ///
 ///   [scopes]                              # shorthand: bare string list
 ///   release = []                          # no paths → manual-only scope
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ScopeEntry {
-    /// Full form: `{ paths = [...], description = "..." }`
+    /// Full form: `{ paths = [...] }`
     Full { paths: Option<Vec<String>> },
     /// Shorthand: just a list of paths `["src/api/**"]`
     PathsOnly(Vec<String>),
