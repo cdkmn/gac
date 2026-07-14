@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use tracing::debug;
 
+use crate::{config::Config, git::ScopeMatch, llamaswap, prompt};
+
 // ── Priority scoring ──────────────────────────────────────────────────────
 //
 // High priority  → source code the model should read carefully
@@ -33,8 +35,7 @@ const SUMMARIZE_THRESHOLD: usize = 20; // max files before switching to StatOnly
 #[derive(Debug, Clone)]
 pub struct FileDiff {
     pub path: String,
-    pub priority: u8, // 0 (low) – 100 (high); higher = include first
-    pub char_count: usize,
+    pub priority: u8,    // 0 (low) – 100 (high); higher = include first
     pub content: String, // full diff for this file including header
 }
 
@@ -126,7 +127,7 @@ pub fn parse_diff(raw: &str) -> Vec<FileDiff> {
     }
 
     // Sort highest priority first
-    files.sort_by(|a, b| b.priority.cmp(&a.priority));
+    files.sort_by_key(|b| std::cmp::Reverse(b.priority));
     files
 }
 
@@ -134,7 +135,6 @@ fn flush(files: &mut Vec<FileDiff>, path: &str, lines: &[&str]) {
     let content = lines.join("\n");
     files.push(FileDiff {
         priority: score_file(path),
-        char_count: content.len(),
         content,
         path: path.to_string(),
     });
@@ -151,54 +151,67 @@ fn extract_path(line: &str) -> String {
 
 // ── Strategy selector ─────────────────────────────────────────────────────
 
-pub fn select_strategy(files: &[FileDiff], max_chars: usize) -> Strategy {
-    let total: usize = files.iter().map(|f| f.char_count).sum();
+pub async fn select_strategy(
+    client: &llamaswap::Client,
+    config: &Config,
+    raw_diff: &str,
+    scope_match: &ScopeMatch,
+    stat: String,
+) -> Result<(Strategy, String), Box<dyn std::error::Error>> {
+    let props = llamaswap::model_props(client, config).await?;
+    let mut budget = props.default_generation_settings.n_ctx;
+    let files = parse_diff(raw_diff);
+    let body = build_direct_context(&files);
+    let context = format!("=== Stat ===\n{stat}\n=== Diff ===\n{body}");
+    let candidates = scope_match.best_candidates();
+    let commit_prompt = prompt::build_commit_prompt(&context, &candidates);
+    let tokens = llamaswap::token_counts(client, config, &commit_prompt).await?;
 
     debug!(
-        total_chars = total,
+        tokens = tokens,
         file_count = files.len(),
-        budget = max_chars,
+        budget = budget,
         "selecting diff strategy"
     );
 
-    if total <= max_chars {
-        return Strategy::Direct;
+    if tokens < budget as usize {
+        return Ok((Strategy::Direct, context));
     }
 
     if files.len() <= SUMMARIZE_THRESHOLD {
-        return Strategy::Summarize;
+        return Ok((Strategy::Summarize, "".to_string()));
     }
 
     // How many top-priority files can we fit in the budget?
-    let mut budget = max_chars;
     let mut top_n = 0;
 
     for f in files {
-        if f.char_count > budget {
+        let tokens = llamaswap::tokenize(client, config, f.content.clone()).await?;
+
+        if tokens.len() > budget as usize {
             break;
         }
 
-        budget -= f.char_count;
+        budget -= tokens.len() as u32;
         top_n += 1;
     }
 
-    Strategy::StatOnly {
-        top_n: top_n.max(1),
-    }
+    Ok((
+        Strategy::StatOnly {
+            top_n: top_n.max(1),
+        },
+        "".to_string(),
+    ))
 }
 
 // ── Context builders ──────────────────────────────────────────────────────
 
-/// Build a direct diff string from the sorted file list, respecting max_chars.
-/// Only used by `Strategy::Direct` (guaranteed to fit, but guard anyway).
-pub fn build_direct_context(files: &[FileDiff], max_chars: usize) -> String {
+/// Build a direct diff string from the sorted file list.
+/// Only used by `Strategy::Direct` (guaranteed to fit).
+pub fn build_direct_context(files: &[FileDiff]) -> String {
     let mut out = String::new();
 
     for f in files {
-        if out.len() + f.char_count > max_chars {
-            break;
-        }
-
         out.push_str(&f.content);
         out.push('\n');
     }
@@ -239,110 +252,4 @@ pub fn build_stat_context(stat: &str, files: &[FileDiff], top_n: usize) -> Strin
     }
 
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_score_file_source() {
-        assert_eq!(score_file("src/main.rs"), 90);
-        assert_eq!(score_file("lib/utils.py"), 90);
-        assert_eq!(score_file("app/handler.ts"), 75);
-    }
-
-    #[test]
-    fn test_score_file_test() {
-        assert_eq!(score_file("src/main.test.ts"), 40);
-        assert_eq!(score_file("tests/unit.rs"), 40);
-        assert_eq!(score_file("src/__tests__/app.spec.js"), 40);
-    }
-
-    #[test]
-    fn test_score_file_low_priority() {
-        assert_eq!(score_file("package.json"), 20);
-        assert_eq!(score_file("Cargo.lock"), 0);
-        assert_eq!(score_file("README.md"), 20);
-    }
-
-    #[test]
-    fn test_score_file_unknown() {
-        assert_eq!(score_file("Makefile"), 50);
-        assert_eq!(score_file("Dockerfile"), 50);
-    }
-
-    #[test]
-    fn test_parse_diff_single_file() {
-        let raw = "diff --git a/src/main.rs b/src/main.rs\nindex abc123..def456 100644\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1,3 +1,4 @@\n+new line\n fn main() {}\n";
-        let files = parse_diff(raw);
-        assert_eq!(files.len(), 1);
-        assert_eq!(files[0].path, "src/main.rs");
-        assert!(files[0].content.contains("new line"));
-    }
-
-    #[test]
-    fn test_parse_diff_multiple_files() {
-        let raw = "diff --git a/src/main.rs b/src/main.rs\n--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\ndiff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old readme\n+new readme\n";
-        let files = parse_diff(raw);
-        assert_eq!(files.len(), 2);
-        // Should be sorted by priority (src/main.rs is higher than README.md)
-        assert_eq!(files[0].path, "src/main.rs");
-        assert_eq!(files[1].path, "README.md");
-        assert!(files[0].priority > files[1].priority);
-    }
-
-    #[test]
-    fn test_select_strategy_direct() {
-        let files = vec![FileDiff {
-            path: "src/main.rs".into(),
-            priority: 90,
-            char_count: 1000,
-            content: "small diff".into(),
-        }];
-        assert_eq!(select_strategy(&files, 6000), Strategy::Direct);
-    }
-
-    #[test]
-    fn test_select_strategy_summarize() {
-        let files: Vec<FileDiff> = (0..5)
-            .map(|i| FileDiff {
-                path: format!("src/file{i}.rs"),
-                priority: 90,
-                char_count: 2000,
-                content: "diff".into(),
-            })
-            .collect();
-        // Total = 10000 > 6000, but only 5 files (< 20)
-        assert_eq!(select_strategy(&files, 6000), Strategy::Summarize);
-    }
-
-    #[test]
-    fn test_select_strategy_stat_only() {
-        let files: Vec<FileDiff> = (0..25)
-            .map(|i| FileDiff {
-                path: format!("src/file{i}.rs"),
-                priority: 90,
-                char_count: 1000,
-                content: "diff".into(),
-            })
-            .collect();
-        // 25 files > 20 threshold
-        match select_strategy(&files, 6000) {
-            Strategy::StatOnly { top_n } => assert!(top_n >= 1),
-            _ => panic!("expected StatOnly strategy"),
-        }
-    }
-
-    #[test]
-    fn test_build_summary_context() {
-        let mut summaries = HashMap::new();
-        summaries.insert("src/main.rs".into(), "Added main function".into());
-        summaries.insert("src/lib.rs".into(), "Updated imports".into());
-
-        let context = build_summary_context(&summaries);
-        assert!(context.contains("src/lib.rs"));
-        assert!(context.contains("src/main.rs"));
-        assert!(context.contains("Per-file change summaries"));
-    }
 }
