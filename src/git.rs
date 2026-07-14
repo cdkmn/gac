@@ -172,9 +172,13 @@ pub(crate) fn build_excludes(patterns: &[String]) -> Vec<String> {
 }
 
 /// Commit staged changes with the given message.
-pub fn commit(message: &str) -> Result<bool> {
+pub fn commit(message: &str, no_verify: bool) -> Result<bool> {
+    let mut args = vec!["commit", "-m", message];
+    if no_verify {
+        args.push("--no-verify");
+    }
     let status = Command::new("git")
-        .args(["commit", "-m", message])
+        .args(&args)
         .status()
         .context("Failed to run git commit")?;
     Ok(status.success())
