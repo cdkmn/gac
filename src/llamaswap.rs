@@ -26,7 +26,6 @@ struct ChatRequest {
 
 #[derive(Deserialize)]
 pub struct DefaultGenerationSettings {
-    // pub params: DefaultGenerationParams,
     pub n_ctx: u32,
 }
 
@@ -140,6 +139,11 @@ struct PerformanceRes {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
+/// Truncate a string for debug logging, avoiding panics on short strings.
+fn truncate_for_debug(s: &str) -> String {
+    s.chars().take(30).collect::<String>()
+}
+
 /// Create a reusable HTTP client with sensible defaults.
 /// Call once per run and pass the reference to all API functions.
 pub fn create_client() -> Client {
@@ -225,7 +229,10 @@ pub async fn generate_streaming(
     };
 
     info!(model = %config.model, "sending chat request");
-    debug!(system = &prompt.system[..30], user = &prompt.user[..30]);
+    debug!(
+        system = truncate_for_debug(&prompt.system),
+        user = truncate_for_debug(&prompt.user)
+    );
 
     // Start spinner before the network call so latency is always covered
     let spin = spinner::generation_spinner(mp, &config.model);
@@ -345,7 +352,10 @@ pub async fn model_props(client: &Client, config: &Config) -> Result<ModelPropRe
 /// Apply the modeltemplate to the prompt and send it to the model for token counts.
 pub async fn apply_template(client: &Client, config: &Config, prompt: &Prompt) -> Result<String> {
     debug!(model= %config.model, "sending apply template request");
-    debug!(system = &prompt.system[..30], user = &prompt.user[..30]);
+    debug!(
+        system = truncate_for_debug(&prompt.system),
+        user = truncate_for_debug(&prompt.user)
+    );
 
     let req = ApplyTemplateRequest {
         messages: build_messages(prompt),
@@ -367,7 +377,7 @@ pub async fn apply_template(client: &Client, config: &Config, prompt: &Prompt) -
     Ok(body.prompt)
 }
 
-/// Count the number of tokens in the prompt using the model's tokenizer.
+/// Tokenize a string into token IDs using the model's tokenizer.
 pub async fn tokenize(client: &Client, config: &Config, content: String) -> Result<Vec<u32>> {
     debug!(model= %config.model,"sending tokenize request");
 
@@ -388,7 +398,7 @@ pub async fn tokenize(client: &Client, config: &Config, content: String) -> Resu
     Ok(body.tokens)
 }
 
-/// Count the number of tokens in the prompt using the model's tokenizer.
+/// Convert token IDs back to text using the model's tokenizer.
 pub async fn detokenize(client: &Client, config: &Config, tokens: Vec<u32>) -> Result<String> {
     debug!(model= %config.model,"sending detokenize request");
 
@@ -409,7 +419,7 @@ pub async fn detokenize(client: &Client, config: &Config, tokens: Vec<u32>) -> R
     Ok(body.content)
 }
 
-/// Count the number of tokens in the prompt using the model's tokenizer.
+/// Count the number of tokens in a prompt (apply template then tokenize).
 pub async fn token_counts(client: &Client, config: &Config, prompt: &Prompt) -> Result<usize> {
     let content = apply_template(client, config, prompt).await?;
     let tokens = tokenize(client, config, content).await?;
@@ -423,7 +433,10 @@ pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Res
         model    = %config.model,
         "sending summarize request (non-streaming)"
     );
-    debug!(system = &prompt.system[..30], user = &prompt.user[..30]);
+    debug!(
+        system = truncate_for_debug(&prompt.system),
+        user = truncate_for_debug(&prompt.user)
+    );
 
     let req = ChatRequest {
         model: config.model.clone(),
