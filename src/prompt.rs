@@ -1,6 +1,6 @@
 use askama::Template; // bring trait in scope
 
-/// A fully constructed prompt ready to send to Ollama.
+/// A fully constructed prompt ready to send to the model.
 pub struct Prompt {
     pub system: String,
     pub user: String,

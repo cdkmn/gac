@@ -1,4 +1,4 @@
-// ── Raw stats captured from Ollama ────────────────────────────────────────
+// ── Raw stats captured from llama-swap ──────────────────────────────────
 
 /// Token and timing stats from the final `/api/chat` done-chunk.
 #[derive(Debug, Default)]

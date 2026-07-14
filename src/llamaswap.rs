@@ -100,7 +100,7 @@ struct ChatChunkTimings {
     predicted_per_second: f64,
 }
 
-// Ollama emits one JSON object per line.
+// llama-swap emits one JSON object per line.
 // The final chunk (done=true) carries all the stat fields.
 #[derive(Deserialize, Default)]
 struct ChatChunk {

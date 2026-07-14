@@ -24,7 +24,7 @@ pub fn multi() -> MultiProgress {
 
 // ── Generation spinner ────────────────────────────────────────────────────
 //
-// Shown while waiting for the first token from Ollama.
+// Shown while waiting for the first token from the model.
 // Cleared (not finished with a symbol) the moment streaming begins so
 // the token output appears on a clean line.
 //
