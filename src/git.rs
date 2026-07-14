@@ -167,7 +167,7 @@ pub fn detect_scopes(staged_files: &[String], scopes: &HashMap<String, ScopeEntr
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-fn build_excludes(patterns: &[String]) -> Vec<String> {
+pub(crate) fn build_excludes(patterns: &[String]) -> Vec<String> {
     patterns.iter().map(|p| format!(":(exclude){p}")).collect()
 }
 
@@ -177,4 +177,110 @@ fn run_git_diff(base_args: &[&str], extra: &[&str]) -> Result<String> {
         .output()
         .context("Failed to run git diff")?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::ScopeEntry;
+
+    // ── build_excludes ─────────────────────────────────────────────────────
+
+    #[test]
+    fn build_excludes_wraps_with_exclude_prefix() {
+        let patterns = vec!["*.lock".into(), "Cargo.lock".into()];
+        let result = build_excludes(&patterns);
+        assert_eq!(result, vec![":(exclude)*.lock", ":(exclude)Cargo.lock"]);
+    }
+
+    #[test]
+    fn build_excludes_empty() {
+        assert!(build_excludes(&[]).is_empty());
+    }
+
+    // ── detect_scopes ──────────────────────────────────────────────────────
+
+    fn make_scopes(entries: Vec<(&str, ScopeEntry)>) -> HashMap<String, ScopeEntry> {
+        entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    #[test]
+    fn detect_scopes_matches_file_against_pattern() {
+        let scopes = make_scopes(vec![
+            ("api", ScopeEntry::PathsOnly(vec!["src/api/**".into()])),
+        ]);
+        let staged = vec!["src/api/handler.rs".into()];
+        let result = detect_scopes(&staged, &scopes);
+        assert_eq!(result.matched, vec!["api"]);
+        assert!(result.unmatched.is_empty());
+    }
+
+    #[test]
+    fn detect_scopes_no_match() {
+        let scopes = make_scopes(vec![
+            ("api", ScopeEntry::PathsOnly(vec!["src/api/**".into()])),
+        ]);
+        let staged = vec!["src/main.rs".into()];
+        let result = detect_scopes(&staged, &scopes);
+        assert!(result.matched.is_empty());
+        assert_eq!(result.unmatched, vec!["api"]);
+    }
+
+    #[test]
+    fn detect_scopes_empty_patterns_go_to_unmatched() {
+        let scopes = make_scopes(vec![
+            ("release", ScopeEntry::PathsOnly(vec![])),
+        ]);
+        let staged = vec!["anything.rs".into()];
+        let result = detect_scopes(&staged, &scopes);
+        assert!(result.matched.is_empty());
+        assert_eq!(result.unmatched, vec!["release"]);
+    }
+
+    #[test]
+    fn detect_scopes_multiple_scopes_sorted() {
+        let scopes = make_scopes(vec![
+            ("z_scope", ScopeEntry::PathsOnly(vec!["z/**".into()])),
+            ("a_scope", ScopeEntry::PathsOnly(vec!["a/**".into()])),
+        ]);
+        let staged = vec!["a/file.rs".into(), "z/file.rs".into()];
+        let result = detect_scopes(&staged, &scopes);
+        assert_eq!(result.matched, vec!["a_scope", "z_scope"]);
+    }
+
+    #[test]
+    fn detect_scopes_full_form_entry() {
+        let scopes = make_scopes(vec![
+            ("auth", ScopeEntry::Full { paths: Some(vec!["src/auth/**".into()]) }),
+        ]);
+        let staged = vec!["src/auth/jwt.rs".into()];
+        let result = detect_scopes(&staged, &scopes);
+        assert_eq!(result.matched, vec!["auth"]);
+    }
+
+    // ── ScopeMatch::best_candidates ────────────────────────────────────────
+
+    #[test]
+    fn best_candidates_prefers_matched() {
+        let sm = ScopeMatch {
+            matched: vec!["api".into(), "auth".into()],
+            unmatched: vec!["db".into()],
+        };
+        assert_eq!(sm.best_candidates(), vec!["api", "auth"]);
+    }
+
+    #[test]
+    fn best_candidates_falls_back_to_unmatched() {
+        let sm = ScopeMatch {
+            matched: vec![],
+            unmatched: vec!["db".into(), "cli".into()],
+        };
+        assert_eq!(sm.best_candidates(), vec!["db", "cli"]);
+    }
+
+    #[test]
+    fn best_candidates_empty_when_nothing_defined() {
+        let sm = ScopeMatch::default();
+        assert!(sm.best_candidates().is_empty());
+    }
 }
