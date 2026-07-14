@@ -117,7 +117,9 @@ pub fn try_fix_commit_message(message: &str) -> String {
             let fixed_subject = if let Some(first_char) = subject.chars().next() {
                 if first_char.is_uppercase() {
                     let mut chars = subject.chars();
-                    chars.next().unwrap().to_lowercase().collect::<String>() + chars.as_str()
+                    // SAFETY: we already confirmed first_char exists via the outer if-let
+                    let first = chars.next().expect("checked above");
+                    first.to_lowercase().collect::<String>() + chars.as_str()
                 } else {
                     subject.to_string()
                 }
