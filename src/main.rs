@@ -108,8 +108,12 @@ fn approval_dialog(message: &str) -> anyhow::Result<Approval> {
         Some(1) => {
             // Open $EDITOR pre-filled with the generated message.
             // dialoguer::Editor returns None if the user saves an empty file.
+            let editor = std::env::var("GAC_EDITOR")
+                .or_else(|_| std::env::var("EDITOR"))
+                .or_else(|_| std::env::var("VISUAL"))
+                .unwrap_or_else(|_| "nvim".into());
             let edited = Editor::new()
-                .executable("nvim")
+                .executable(&editor)
                 .require_save(true) // treat empty save as abort
                 .edit(message)?;
 
@@ -393,11 +397,7 @@ async fn main() -> Result<()> {
     };
 
     debug!(message = %final_message, "running git commit");
-    let status = std::process::Command::new("git")
-        .args(["commit", "-m", &final_message])
-        .status()?;
-
-    if status.success() {
+    if git::commit(&final_message)? {
         info!("committed successfully");
     } else {
         anyhow::bail!("git commit failed");
