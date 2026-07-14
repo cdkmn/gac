@@ -171,6 +171,15 @@ pub(crate) fn build_excludes(patterns: &[String]) -> Vec<String> {
     patterns.iter().map(|p| format!(":(exclude){p}")).collect()
 }
 
+/// Commit staged changes with the given message.
+pub fn commit(message: &str) -> Result<bool> {
+    let status = Command::new("git")
+        .args(["commit", "-m", message])
+        .status()
+        .context("Failed to run git commit")?;
+    Ok(status.success())
+}
+
 fn run_git_diff(base_args: &[&str], extra: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(base_args.iter().chain(extra.iter()).copied())
