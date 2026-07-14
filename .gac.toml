@@ -57,5 +57,8 @@ paths = ["templates/**"]
 [scopes.deps]
 paths = ["Cargo.toml", "Cargo.lock"]
 
+[scopes.build]
+paths = [".cargo/**"]
+
 [scopes.project]
 paths = ["./*"]
