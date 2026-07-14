@@ -163,6 +163,7 @@ async fn main() -> Result<()> {
     // ── Config ────────────────────────────────────────────────────────────
     let mut config = Config::load()?;
     config.apply_cli_overrides(cli.model);
+    config.validate()?;
 
     // ── Staged files ──────────────────────────────────────────────────────
     let all_staged = git::get_staged_files();
