@@ -1,3 +1,5 @@
+#![warn(unused_crate_dependencies)]
+
 mod config;
 mod diff;
 mod git;
@@ -8,7 +10,7 @@ mod spinner;
 mod stats;
 mod validate;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
 use diff::Strategy;
@@ -210,7 +212,7 @@ async fn main() -> Result<()> {
     let (strategy, ctx) =
         diff::select_strategy(&client, &config, &raw_diff, &scope_match, stat.clone())
             .await
-            .unwrap();
+            .context("failed to select diff strategy")?;
 
     info!(
         diff_chars = raw_diff.len(),
@@ -227,7 +229,9 @@ async fn main() -> Result<()> {
 
             // One shared progress bar for the whole summarize pass
             let bar = spinner::summarize_bar(&mp, file_diffs.len());
-            let props = llamaswap::model_props(&client, &config).await.unwrap();
+            let props = llamaswap::model_props(&client, &config)
+                .await
+                .context("failed to fetch model properties")?;
             let budget = props.default_generation_settings.n_ctx;
             let mut summaries: HashMap<String, String> = HashMap::new();
             let mut completed = 0u64;
@@ -235,7 +239,7 @@ async fn main() -> Result<()> {
             for fd in &file_diffs {
                 let tokens = llamaswap::tokenize(&client, &config, fd.content.clone())
                     .await
-                    .unwrap();
+                    .context("failed to tokenize file diff")?;
 
                 let chunk = if tokens.len() > (budget / 2) as usize {
                     let detokenized = llamaswap::detokenize(
@@ -244,7 +248,7 @@ async fn main() -> Result<()> {
                         tokens[..(budget / 2) as usize].to_vec(),
                     )
                     .await
-                    .unwrap();
+                    .context("failed to detokenize truncated diff")?;
                     format!("{}\n[... truncated ...]", detokenized)
                 } else {
                     fd.content.clone()
