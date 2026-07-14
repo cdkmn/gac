@@ -253,3 +253,180 @@ pub fn build_stat_context(stat: &str, files: &[FileDiff], top_n: usize) -> Strin
 
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── score_file ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn score_low_priority_name_returns_zero() {
+        assert_eq!(score_file("Cargo.lock"), 0);
+        assert_eq!(score_file("package-lock.json"), 0);
+        assert_eq!(score_file("go.sum"), 0);
+    }
+
+    #[test]
+    fn score_source_in_src_is_ninety() {
+        assert_eq!(score_file("src/main.rs"), 90);
+        assert_eq!(score_file("src/auth/jwt.ts"), 90);
+        assert_eq!(score_file("lib/utils.py"), 90);
+    }
+
+    #[test]
+    fn score_source_outside_src_is_seventy_five() {
+        assert_eq!(score_file("app/server.go"), 75);
+    }
+
+    #[test]
+    fn score_test_files_are_forty() {
+        assert_eq!(score_file("src/foo_test.rs"), 40);
+        assert_eq!(score_file("src/bar.spec.ts"), 40);
+        assert_eq!(score_file("__tests__/unit.js"), 40);
+    }
+
+    #[test]
+    fn score_low_priority_ext_is_twenty() {
+        assert_eq!(score_file("config.yaml"), 20);
+        assert_eq!(score_file("README.md"), 20);
+        assert_eq!(score_file("style.css"), 20);
+    }
+
+    #[test]
+    fn score_unknown_ext_is_fifty() {
+        assert_eq!(score_file("Makefile"), 50);
+        assert_eq!(score_file("Dockerfile"), 50);
+    }
+
+    // ── parse_diff ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_diff_empty_string() {
+        assert!(parse_diff("").is_empty());
+    }
+
+    #[test]
+    fn parse_diff_single_file() {
+        let raw = "\
+diff --git a/src/main.rs b/src/main.rs
+index abc..def 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,3 @@
+-fn old() {}
++fn new() {}
+";
+        let files = parse_diff(raw);
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].path, "src/main.rs");
+        assert!(files[0].content.contains("fn new() {}"));
+    }
+
+    #[test]
+    fn parse_diff_multiple_files() {
+        let raw = "\
+diff --git a/src/a.rs b/src/a.rs
+index aaa..bbb 100644
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/src/b.rs b/src/b.rs
+index ccc..ddd 100644
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-old2
++new2
+";
+        let files = parse_diff(raw);
+        assert_eq!(files.len(), 2);
+        assert_eq!(files[0].path, "src/a.rs");
+        assert_eq!(files[1].path, "src/b.rs");
+    }
+
+    #[test]
+    fn parse_diff_extracts_path_from_b_prefix() {
+        let raw = "\
+diff --git a/old_name.rs b/new_name.rs
+index aaa..bbb 100644
+--- a/old_name.rs
++++ b/new_name.rs
+";
+        let files = parse_diff(raw);
+        assert_eq!(files[0].path, "new_name.rs");
+    }
+
+    // ── build_direct_context ───────────────────────────────────────────────
+
+    #[test]
+    fn build_direct_context_concatenates_content() {
+        let files = vec![
+            FileDiff { path: "a.rs".into(), priority: 90, content: "diff-a".into() },
+            FileDiff { path: "b.rs".into(), priority: 75, content: "diff-b".into() },
+        ];
+        let ctx = build_direct_context(&files);
+        assert_eq!(ctx, "diff-a\ndiff-b\n");
+    }
+
+    #[test]
+    fn build_direct_context_empty() {
+        assert_eq!(build_direct_context(&[]), "");
+    }
+
+    // ── build_summary_context ──────────────────────────────────────────────
+
+    #[test]
+    fn build_summary_context_sorted_by_path() {
+        let mut summaries = HashMap::new();
+        summaries.insert("b.rs".into(), "changed b".into());
+        summaries.insert("a.rs".into(), "changed a".into());
+        let ctx = build_summary_context(&summaries);
+        let a_pos = ctx.find("a.rs").unwrap();
+        let b_pos = ctx.find("b.rs").unwrap();
+        assert!(a_pos < b_pos, "a.rs should appear before b.rs");
+    }
+
+    #[test]
+    fn build_summary_context_header() {
+        let summaries = HashMap::new();
+        let ctx = build_summary_context(&summaries);
+        assert!(ctx.starts_with("Per-file change summaries:"));
+    }
+
+    // ── build_stat_context ─────────────────────────────────────────────────
+
+    #[test]
+    fn build_stat_context_includes_top_n_files() {
+        let files = vec![
+            FileDiff { path: "a.rs".into(), priority: 90, content: "diff-a".into() },
+            FileDiff { path: "b.rs".into(), priority: 75, content: "diff-b".into() },
+            FileDiff { path: "c.rs".into(), priority: 50, content: "diff-c".into() },
+        ];
+        let ctx = build_stat_context("stat output", &files, 2);
+        assert!(ctx.contains("diff-a"));
+        assert!(ctx.contains("diff-b"));
+        assert!(!ctx.contains("diff-c"));
+        assert!(ctx.contains("1 lower-priority file(s) omitted"));
+    }
+
+    #[test]
+    fn build_stat_context_no_skipped_when_top_n_covers_all() {
+        let files = vec![
+            FileDiff { path: "a.rs".into(), priority: 90, content: "diff-a".into() },
+        ];
+        let ctx = build_stat_context("stat", &files, 5);
+        assert!(!ctx.contains("omitted"));
+    }
+
+    // ── Strategy Display ───────────────────────────────────────────────────
+
+    #[test]
+    fn strategy_display() {
+        assert_eq!(Strategy::Direct.to_string(), "direct");
+        assert_eq!(Strategy::Summarize.to_string(), "per-file summarize");
+        assert_eq!(Strategy::StatOnly { top_n: 3 }.to_string(), "stat + top-3 files");
+    }
+}
