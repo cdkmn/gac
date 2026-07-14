@@ -30,15 +30,19 @@ struct ScopeTemplate<'a> {
 pub fn commit_system(scope_candidates: &[&str]) -> String {
     let scope_rule = match scope_candidates {
         [] => include_str!("../templates/empty_scope.md").to_string(),
-        [single] => SingleScope { single }.render().unwrap(),
-        candidates => ScopeTemplate { candidates }.render().unwrap(),
+        [single] => SingleScope { single }
+            .render()
+            .expect("failed to render single scope template"),
+        candidates => ScopeTemplate { candidates }
+            .render()
+            .expect("failed to render scope template"),
     };
 
     CommitSystem {
         scope_rule: &scope_rule,
     }
     .render()
-    .unwrap()
+    .expect("failed to render commit system template")
 }
 
 /// User message for the final commit generation pass.
