@@ -201,14 +201,18 @@ mod tests {
     // ── detect_scopes ──────────────────────────────────────────────────────
 
     fn make_scopes(entries: Vec<(&str, ScopeEntry)>) -> HashMap<String, ScopeEntry> {
-        entries.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+        entries
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect()
     }
 
     #[test]
     fn detect_scopes_matches_file_against_pattern() {
-        let scopes = make_scopes(vec![
-            ("api", ScopeEntry::PathsOnly(vec!["src/api/**".into()])),
-        ]);
+        let scopes = make_scopes(vec![(
+            "api",
+            ScopeEntry::PathsOnly(vec!["src/api/**".into()]),
+        )]);
         let staged = vec!["src/api/handler.rs".into()];
         let result = detect_scopes(&staged, &scopes);
         assert_eq!(result.matched, vec!["api"]);
@@ -217,9 +221,10 @@ mod tests {
 
     #[test]
     fn detect_scopes_no_match() {
-        let scopes = make_scopes(vec![
-            ("api", ScopeEntry::PathsOnly(vec!["src/api/**".into()])),
-        ]);
+        let scopes = make_scopes(vec![(
+            "api",
+            ScopeEntry::PathsOnly(vec!["src/api/**".into()]),
+        )]);
         let staged = vec!["src/main.rs".into()];
         let result = detect_scopes(&staged, &scopes);
         assert!(result.matched.is_empty());
@@ -228,9 +233,7 @@ mod tests {
 
     #[test]
     fn detect_scopes_empty_patterns_go_to_unmatched() {
-        let scopes = make_scopes(vec![
-            ("release", ScopeEntry::PathsOnly(vec![])),
-        ]);
+        let scopes = make_scopes(vec![("release", ScopeEntry::PathsOnly(vec![]))]);
         let staged = vec!["anything.rs".into()];
         let result = detect_scopes(&staged, &scopes);
         assert!(result.matched.is_empty());
@@ -250,9 +253,12 @@ mod tests {
 
     #[test]
     fn detect_scopes_full_form_entry() {
-        let scopes = make_scopes(vec![
-            ("auth", ScopeEntry::Full { paths: Some(vec!["src/auth/**".into()]) }),
-        ]);
+        let scopes = make_scopes(vec![(
+            "auth",
+            ScopeEntry::Full {
+                paths: Some(vec!["src/auth/**".into()]),
+            },
+        )]);
         let staged = vec!["src/auth/jwt.rs".into()];
         let result = detect_scopes(&staged, &scopes);
         assert_eq!(result.matched, vec!["auth"]);
