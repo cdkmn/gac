@@ -179,7 +179,7 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
     Ok(response)
 }
 
-async fn query_vram(client: &Client, endpoint: &str, now: String) -> Option<PerfGpuStat> {
+async fn query_vram(client: &Client, endpoint: &str, now: &str) -> Option<PerfGpuStat> {
     let url = format!("{endpoint}/api/performance?after={now}");
     let Ok(resp) = client.get(&url).send().await else {
         warn!("could not reach /api/performance — VRAM stats unavailable");
@@ -325,7 +325,7 @@ pub async fn generate_streaming(
 
     // VRAM query after streaming — best-effort, never blocks the happy path
     let vram_spin = spinner::step_spinner(mp, "querying VRAM usage…");
-    let gpu_stat = query_vram(client, &config.endpoint, now).await;
+    let gpu_stat = query_vram(client, &config.endpoint, &now).await;
     spinner::clear(&vram_spin);
 
     if let Some(gpu_stat) = gpu_stat {
@@ -453,13 +453,12 @@ pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Res
         max_completion_tokens: Some(config.max_completion_tokens),
     };
 
-    let response = check_response(
-        client
-            .post(format!("{}/v1/chat/completions", config.endpoint))
-            .json(&req)
-            .send()
-            .await?,
-    )
+    let response = with_retry(|| {
+        let client = client.clone();
+        let url = format!("{}/v1/chat/completions", config.endpoint);
+        let req = req.clone();
+        async move { check_response(client.post(&url).json(&req).send().await?).await }
+    })
     .await?;
 
     let body: ChatResponse = response.json().await?;

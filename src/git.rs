@@ -18,8 +18,7 @@ pub fn get_staged_stat_and_diff(exclude_patterns: &[String]) -> anyhow::Result<(
     );
 
     let excludes = build_excludes(exclude_patterns);
-    let refs: Vec<&str> = excludes.iter().map(|s| s.as_str()).collect();
-    let stat = run_git_diff(&["diff", "--cached", "--stat", "--"], &refs)?;
+    let stat = run_git_diff(&["diff", "--cached", "--stat", "--"], &excludes)?;
 
     debug!(stat = %stat.trim(), "git diff --stat");
 
@@ -36,7 +35,7 @@ pub fn get_staged_stat_and_diff(exclude_patterns: &[String]) -> anyhow::Result<(
             "-U3",
             "--",
         ],
-        &refs,
+        &excludes,
     )?;
 
     if diff.trim().is_empty() {
@@ -68,15 +67,10 @@ pub fn get_staged_files() -> Vec<String> {
 /// Returns files that were excluded by the exclude_patterns filter.
 pub fn get_excluded_files(all: &[String], exclude_patterns: &[String]) -> Vec<String> {
     let excludes = build_excludes(exclude_patterns);
-    let exclude_refs: Vec<&str> = excludes.iter().map(|s| s.as_str()).collect();
 
     let kept: std::collections::HashSet<String> = match Command::new("git")
-        .args(
-            ["diff", "--cached", "--name-only", "--"]
-                .iter()
-                .chain(exclude_refs.iter())
-                .copied(),
-        )
+        .args(["diff", "--cached", "--name-only", "--"])
+        .args(&excludes)
         .output()
     {
         Ok(o) => String::from_utf8_lossy(&o.stdout)
@@ -184,9 +178,10 @@ pub fn commit(message: &str, no_verify: bool) -> Result<bool> {
     Ok(status.success())
 }
 
-fn run_git_diff(base_args: &[&str], extra: &[&str]) -> Result<String> {
+fn run_git_diff(base_args: &[&str], extra: &[String]) -> Result<String> {
     let output = Command::new("git")
-        .args(base_args.iter().chain(extra.iter()).copied())
+        .args(base_args)
+        .args(extra)
         .output()
         .context("Failed to run git diff")?;
     Ok(String::from_utf8_lossy(&output.stdout).to_string())

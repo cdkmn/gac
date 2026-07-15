@@ -249,17 +249,19 @@ async fn main() -> Result<()> {
                     .await
                     .context("failed to tokenize file diff")?;
 
-                let chunk = if tokens.len() > (budget / 2) as usize {
+                let truncated;
+                let diff_ref: &str = if tokens.len() > (budget / 2) as usize {
                     let detokenized =
                         llamaswap::detokenize(&client, &config, &tokens[..(budget / 2) as usize])
                             .await
                             .context("failed to detokenize truncated diff")?;
-                    format!("{}\n[... truncated ...]", detokenized)
+                    truncated = format!("{}\n[... truncated ...]", detokenized);
+                    &truncated
                 } else {
-                    fd.content.to_owned()
+                    &fd.content
                 };
 
-                let p = prompt::build_file_summary_prompt(&fd.path, &chunk);
+                let p = prompt::build_file_summary_prompt(&fd.path, diff_ref);
                 let result = llamaswap::summarize(&client, &config, &p).await;
 
                 completed += 1;
