@@ -130,7 +130,7 @@ impl Config {
         Ok(base)
     }
 
-    fn apply_file(&mut self, path: &PathBuf) -> Result<()> {
+    fn apply_file(&mut self, path: &std::path::Path) -> Result<()> {
         let raw = std::fs::read_to_string(path)?;
         let file: FileConfig = toml::from_str(&raw)
             .map_err(|e| anyhow::anyhow!("Invalid config at {}: {}", path.display(), e))?;
