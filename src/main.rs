@@ -1,6 +1,7 @@
 #![warn(unused_crate_dependencies)]
 
 mod config;
+mod crypto;
 mod diff;
 mod git;
 mod llamaswap;
@@ -10,7 +11,7 @@ mod spinner;
 mod stats;
 mod validate;
 
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
 use diff::Strategy;
@@ -43,6 +44,10 @@ struct Cli {
 
     #[arg(short, long)]
     model: Option<String>,
+
+    /// API key for llama-swap authentication
+    #[arg(long, env = "GAC_API_KEY")]
+    api_key: Option<String>,
 
     /// Show info-level messages: config paths, strategy selection, scope detection
     #[arg(short, long, conflicts_with = "debug")]
@@ -162,16 +167,55 @@ async fn main() -> Result<()> {
         };
     }
 
-    // ── Shared MultiProgress — all spinners/bars share one instance ───────
-    let mp = spinner::multi();
-
-    // ── HTTP client (reused across all API calls) ─────────────────────────
-    let client = llamaswap::create_client();
-
     // ── Config ────────────────────────────────────────────────────────────
     let mut config = Config::load()?;
     config.apply_cli_overrides(cli.model);
     config.validate()?;
+
+    // ── API key resolution ───────────────────────────────────────────────
+    // Priority: CLI flag (--api-key) > env var (GAC_API_KEY) > config file > prompt
+    let api_key = cli.api_key.or_else(|| config.api_key.clone());
+
+    let api_key = match api_key {
+        Some(key) if !key.is_empty() => Some(key),
+        _ if cli.print => {
+            bail!(
+                "no API key configured — use --api-key flag, GAC_API_KEY env var,
+  \
+                   or configure in ~/.config/gac/config.toml"
+            );
+        }
+        _ => {
+            use dialoguer::Password;
+
+            eprintln!(
+                "{}",
+                dialoguer::console::style("● No API key configured.").cyan()
+            );
+            let key = Password::new()
+                .with_prompt("Enter your llama-swap API key")
+                .interact()?;
+
+            if key.is_empty() {
+                bail!("API key cannot be empty");
+            }
+
+            Config::save_api_key(&key)?;
+            eprintln!(
+                "{}",
+                dialoguer::console::style("✔ API key saved to ~/.config/gac/config.toml")
+                    .green()
+                    .bold()
+            );
+            Some(key)
+        }
+    };
+
+    // ── HTTP client (reused across all API calls) ─────────────────────────
+    let client = llamaswap::create_client(api_key.as_deref());
+
+    // ── Shared MultiProgress — all spinners/bars share one instance ───────
+    let mp = spinner::multi();
 
     // ── Staged files ──────────────────────────────────────────────────────
     let all_staged = git::get_staged_files();

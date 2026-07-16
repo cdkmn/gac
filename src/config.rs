@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf};
 use tracing::{debug, info};
@@ -48,6 +48,8 @@ struct FileConfig {
     exclude_patterns: Option<Vec<String>>,
     /// `[scopes]` table: scope name → entry
     scopes: Option<HashMap<String, ScopeEntry>>,
+    /// Encrypted API key for llama-swap authentication
+    api_key_encrypted: Option<String>,
 }
 
 // ── Resolved config ───────────────────────────────────────────────────────
@@ -63,6 +65,8 @@ pub struct Config {
     pub exclude_patterns: Vec<String>,
     /// All scopes defined in `.gac.toml`, keyed by name.
     pub scopes: HashMap<String, ScopeEntry>,
+    /// Decrypted API key for llama-swap authentication
+    pub api_key: Option<String>,
 }
 
 impl Default for Config {
@@ -73,6 +77,7 @@ impl Default for Config {
             max_completion_tokens: 4096,
             exclude_patterns: default_excludes(),
             scopes: HashMap::new(),
+            api_key: None,
         }
     }
 }
@@ -105,6 +110,27 @@ fn find_project_config() -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Write or replace the `api_key_encrypted` field in a TOML config file.
+/// Appends the field at the end if it doesn't exist, or replaces the line if it does.
+fn save_encrypted_api_key(path: &std::path::Path, encrypted: &str) -> Result<()> {
+    let content = std::fs::read_to_string(path).unwrap_or_default();
+
+    // Remove existing api_key_encrypted lines
+    let cleaned: String = content
+        .lines()
+        .filter(|line| !line.trim_start().starts_with("api_key_encrypted"))
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut new_content = cleaned.trim_end().to_string();
+    new_content.push_str(&format!(
+        "\n\n# API key for llama-swap authentication (auto-encrypted)\napi_key_encrypted = \"{encrypted}\"\n"
+    ));
+
+    std::fs::write(path, &new_content).context("failed to write config file")?;
+    Ok(())
 }
 
 impl Config {
@@ -157,6 +183,16 @@ impl Config {
             self.scopes = s;
         }
 
+        // API key: try to decrypt the encrypted value
+        if let Some(encrypted) = file.api_key_encrypted {
+            match crate::crypto::decrypt(&encrypted) {
+                Ok(key) => self.api_key = Some(key),
+                Err(e) => {
+                    debug!(error = %e, "could not decrypt API key from config");
+                }
+            }
+        }
+
         debug!(
             model = %self.model,
             max_completion_tokens = self.max_completion_tokens,
@@ -171,6 +207,23 @@ impl Config {
         if let Some(m) = model {
             self.model = m;
         }
+    }
+
+    /// Encrypt and save the API key to the user-level config file.
+    /// Creates the file and directory if they don't exist.
+    pub fn save_api_key(key: &str) -> Result<()> {
+        let encrypted = crate::crypto::encrypt(key).context("failed to encrypt API key")?;
+        let path = dirs::config_dir()
+            .context("cannot determine config directory")?
+            .join("gac")
+            .join("config.toml");
+
+        // Ensure directory exists
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).context("failed to create config directory")?;
+        }
+
+        save_encrypted_api_key(&path, &encrypted)
     }
 
     /// Validate the resolved config. Call after loading and applying CLI overrides.

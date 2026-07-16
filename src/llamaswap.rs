@@ -145,12 +145,20 @@ fn truncate_for_debug(s: &str) -> String {
 }
 
 /// Create a reusable HTTP client with sensible defaults.
-/// Call once per run and pass the reference to all API functions.
-pub fn create_client() -> Client {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .expect("failed to create HTTP client")
+/// If `api_key` is provided, all requests will include `Authorization: Bearer <key>`.
+pub fn create_client(api_key: Option<&str>) -> Client {
+    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(300));
+
+    if let Some(key) = api_key {
+        let mut headers = reqwest::header::HeaderMap::new();
+        let value = reqwest::header::HeaderValue::from_str(&format!("Bearer {key}"))
+            .expect("valid Authorization header value");
+        headers.insert(reqwest::header::AUTHORIZATION, value);
+        builder = builder.default_headers(headers);
+        debug!("API key loaded — requests will include Authorization header");
+    }
+
+    builder.build().expect("failed to create HTTP client")
 }
 
 fn build_messages(prompt: &Prompt) -> Vec<Message> {
