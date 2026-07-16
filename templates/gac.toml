@@ -9,6 +9,9 @@ model = "Gemma-4:E4B-QAT"
 # An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens
 max_completion_tokens = 4096
 
+# API key for llama-swap authentication (auto-encrypted, do not edit manually)
+# api_key_encrypted = "..."
+
 # Patterns for excluding files
 exclude_patterns = [
   "package-lock.json",
