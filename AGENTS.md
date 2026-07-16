@@ -30,6 +30,7 @@ gac/
 ├── src/
 │   ├── main.rs       # Entry point, CLI parsing, orchestration
 │   ├── config.rs     # Config loading (.gac.toml), scope definitions
+│   ├── crypto.rs     # AES-256-GCM + Argon2id API key encryption
 │   ├── diff.rs       # Git diff parsing, priority scoring, strategy selection
 │   ├── git.rs        # Git operations (staged files, scopes, excludes)
 │   ├── logging.rs    # Custom CLI logging formatter
@@ -40,6 +41,7 @@ gac/
 │   └── validate.rs   # Conventional commit validation + auto-fix
 ├── templates/        # Askama templates for system prompts (.md extension)
 ├── Cargo.toml
+├── ARCHITECTURE.md   # Detailed architecture docs (GitNexus-generated)
 └── .gac.toml         # Project config
 ```
 
