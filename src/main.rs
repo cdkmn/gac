@@ -218,7 +218,7 @@ async fn main() -> Result<()> {
     let mp = spinner::multi();
 
     // ── Staged files ──────────────────────────────────────────────────────
-    let all_staged = git::get_staged_files();
+    let all_staged = git::get_staged_files()?;
     debug!(count = all_staged.len(), "found staged files");
 
     let excluded = git::get_excluded_files(&all_staged, &config.exclude_patterns);

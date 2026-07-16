@@ -48,20 +48,22 @@ pub fn get_staged_stat_and_diff(exclude_patterns: &[String]) -> anyhow::Result<(
 // ── Staged file list ──────────────────────────────────────────────────────
 
 /// Returns every file currently in the index, including excluded ones.
-pub fn get_staged_files() -> Vec<String> {
-    match Command::new("git")
+pub fn get_staged_files() -> Result<Vec<String>> {
+    let output = Command::new("git")
         .args(["diff", "--cached", "--name-only"])
         .output()
-    {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .lines()
-            .map(|l| l.to_string())
-            .collect(),
-        Err(e) => {
-            warn!(error = %e, "failed to run git diff --cached --name-only");
-            Vec::new()
-        }
+        .context("Failed to run git diff --cached --name-only")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        warn!(error = %stderr, "git diff --cached --name-only failed");
+        anyhow::bail!("git diff failed: {}", stderr);
     }
+
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|l| l.to_string())
+        .collect())
 }
 
 /// Returns files that were excluded by the exclude_patterns filter.
