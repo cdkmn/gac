@@ -171,8 +171,7 @@ pub async fn select_strategy(
     scope_match: &ScopeMatch,
     stat: &str,
 ) -> anyhow::Result<(Strategy, String)> {
-    let props = llamaswap::model_props(client, config).await?;
-    let mut budget = props.default_generation_settings.n_ctx;
+    let mut budget = llamaswap::model_ctx_len(client, config).await?;
     let files = parse_diff(raw_diff);
     let body = build_direct_context(&files);
     let context = format!("=== Stat ===\n{stat}\n=== Diff ===\n{body}");
@@ -205,7 +204,7 @@ pub async fn select_strategy(
             break;
         }
 
-        budget -= tokens.len() as u32;
+        budget -= tokens.len() as u64;
         top_n += 1;
     }
 

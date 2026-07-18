@@ -90,6 +90,19 @@ impl GenerationStats {
             style("──────────────────────────────────────────").dim()
         );
     }
+
+    /// Minimal one-line summary used after a validation retry, where the full
+    /// block would be redundant noise. e.g. "out 84 tok · 41.2 tok/s · 2040ms"
+    pub fn print_quiet_summary(&self) {
+        use dialoguer::console::style;
+        eprintln!(
+            "  {} {} · {} · {}ms",
+            style("out").dim(),
+            style(format!("{} tok", self.output_tokens)).green(),
+            style(format!("{:.1} tok/s", self.tokens_per_second)).green(),
+            style(format!("{}", self.total_ms as u64)).dim(),
+        );
+    }
 }
 
 // ── Visual VRAM bar ───────────────────────────────────────────────────────

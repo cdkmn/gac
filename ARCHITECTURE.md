@@ -1,364 +1,239 @@
-# gac Architecture Documentation
-
-> **AI-powered commit message generator** using llama-swap (llama.cpp proxy) with intelligent diff strategies.
-
----
+# gac — Architecture Overview
 
 ## Overview
 
-`gac` is a Rust CLI tool that generates conventional commit messages from staged git changes. It uses a three-tier diff strategy to handle diffs of any size within the LLM context window:
+`gac` is a Rust CLI tool that generates AI-powered conventional commit messages using a local LLM via [llama-swap](https://github.com/nicholasgasior/llama-swap) (a llama.cpp proxy). It parses staged git diffs, selects a generation strategy based on diff size, builds context-aware prompts, streams the generation, validates the output, and optionally commits.
 
-| Strategy | Trigger | Approach |
-|----------|---------|----------|
-| **Direct** | Diff fits in context | Send full diff directly to LLM |
-| **Summarize** | ≤ 20 files, too large for direct | Summarize each file via separate LLM calls, combine summaries |
-| **StatOnly** | > 20 files | Use `git diff --stat` + top-N priority file diffs |
+### Design Principles
 
-The config cascade: **defaults → user config (`~/.config/gac/config.toml`) → project config (`.gac.toml`)**. CLI only overrides `--model`.
+- **Low-VRAM first**: Designed for consumer GPUs. Uses streaming to avoid loading full context into VRAM, truncates diffs aggressively, and supports summarization for large changesets.
+- **Conventional Commits**: Output is validated against the Conventional Commits spec (`type(scope): description`) with auto-retry and auto-fix.
+- **Minimal friction**: Interactive approval dialog with commit/edit/abort, or `--print` for piping. `--quiet` suppresses all UI except the final message.
 
----
+## Project Structure
 
-## Functional Areas (Clusters)
+```text
+gac/
+├── src/
+│   ├── main.rs       # Entry point, CLI parsing, orchestration, approval dialog
+│   ├── config.rs     # Config loading (.gac.toml), scope definitions, API key management
+│   ├── crypto.rs     # AES-256-GCM + Argon2id API key encryption at rest
+│   ├── diff.rs       # Git diff parsing, priority scoring, strategy selection
+│   ├── git.rs        # Git operations (staged files, scopes, excludes, commit)
+│   ├── logging.rs    # Custom CLI logging formatter (tracing-based)
+│   ├── llamaswap.rs  # llama-swap API client (streaming, tokenize/detokenize, VRAM query)
+│   ├── prompt.rs     # Prompt building with Askama templates
+│   ├── spinner.rs    # StepTracker, progress spinners/bars (indicatif)
+│   ├── stats.rs      # Generation stats display (tokens, VRAM, timing)
+│   └── validate.rs   # Conventional commit validation + auto-fix
+├── templates/        # Askama templates for system prompts (.md extension)
+├── Cargo.toml
+├── ARCHITECTURE.md   # This file
+└── .gac.toml         # Project config
+```
 
-Based on GitNexus code analysis, the codebase organizes into **14 functional clusters** with varying cohesion:
-
-| Cluster | Symbols | Cohesion | Key Files | Description |
-|---------|---------|----------|-----------|-------------|
-| **Cluster_3** (Diff Strategy) | 12 | 0.77 | `diff.rs` | Strategy selection, priority scoring, context building |
-| **Cluster_7** (CLI Entry) | 10 | 0.45 | `main.rs` | CLI parsing, orchestration, approval flow |
-| **Cluster_0** (Config) | 7 | 0.75 | `config.rs` | Config loading, cascading, validation, encryption |
-| **Cluster_2** (Diff Parsing) | 7 | 0.86 | `diff.rs` | Git diff parsing, file scoring, path extraction |
-| **Cluster_8** (Scope Detection) | 7 | 0.95 | `git.rs` | Scope matching against staged files |
-| **Cluster_11** (LLM Streaming) | 7 | 0.67 | `llamaswap.rs` | llama-swap API client (chat, tokenize, summarize, VRAM) |
-| **Cluster_12** (Prompt Templates) | 4 | 0.67 | `prompt.rs` | Askama templates for commit, summary, retry prompts |
-| **Cluster_15** (Validation) | 4 | 0.86 | `validate.rs` | Conventional commit validation + auto-fix |
-| **Cluster_6** (Generation Stats) | 5 | 0.80 | `stats.rs` | Token/timing/VRAM display with visual bars |
-| **Cluster_1** (Git Ops) | 3 | 0.80 | `git.rs` | Staged files, diff execution, commit execution |
-| **Cluster_13** (Spinner UI) | 3 | 0.80 | `spinner.rs` | Progress spinners/bars via indicatif |
-| **Cluster_14** (Crypto) | 2 | 1.00 | `crypto.rs` | AES-256-GCM + Argon2id API key encryption |
-| **Build_summary_context** | 3 | 0.80 | `diff.rs` | Summary context builder |
-| **Build_stat_context** | 3 | 0.80 | `diff.rs` | Stat-only context builder |
-
----
-
-## Key Execution Flows (Processes)
-
-GitNexus identifies **33 execution flows**. The top 5 by step count:
-
-### 1. `Select_strategy → FileDiff` (Cross-community, 4 steps)
-**Entry:** `diff.rs:select_strategy` → `diff.rs:parse_diff` → `diff.rs:build_direct_context` → `diff.rs:Strategy::Direct`
-**Communities:** Cluster_3 (Diff Strategy) ↔ Cluster_2 (Diff Parsing)
-**Purpose:** Determines if full diff fits in context window; falls back to Summarize/StatOnly.
-
-### 2. `Select_strategy → Score_file` (Cross-community, 4 steps)
-**Entry:** `diff.rs:select_strategy` → scores each file via `score_file` → decides strategy
-**Communities:** Cluster_3 ↔ Cluster_2
-**Purpose:** Priority scoring drives which files get full diffs in StatOnly mode.
-
-### 3. `Parse_diff_single_file → FileDiff` (Intra-community, 4 steps)
-**Entry:** `diff.rs:parse_diff_single_file` → `extract_path` → `flush` → `FileDiff`
-**Community:** Cluster_2 (Diff Parsing)
-**Purpose:** Parses individual file diff from raw git output.
-
-### 4. `Parse_diff_multiple_files → FileDiff` (Intra-community, 4 steps)
-**Entry:** `diff.rs:parse_diff_multiple_files` → iterates `parse_diff_single_file` → sorts by priority
-**Community:** Cluster_2
-**Purpose:** Splits multi-file diff, scores each file, returns priority-sorted list.
-
-### 5. `Main → To_filter` / `Main → Fmt` / `Main → CliFormatter` (Cross-community, 3 steps)
-**Entry:** `main.rs:main` → config loading → git operations → diff strategy → prompt → LLM → validation → approval → commit
-**Communities:** Cluster_7 (CLI) ↔ Cluster_1 (Git Ops) ↔ Cluster_0 (Config) ↔ Cluster_3 (Diff) ↔ Cluster_11 (LLM) ↔ Cluster_15 (Validate)
-
----
-
-## Mermaid Architecture Diagram
+## Functional Areas
 
 ```mermaid
-graph TB
-    %% CLI Entry Point
-    subgraph CLI["CLI Entry (main.rs)"]
-        Main[main()]
-        CliParse[CLI Parsing\nclap]
-        LogInit[Logging Init\ntracing]
-        ApprovalDialog[Approval Dialog\ndialoguer]
+graph TD
+    subgraph CLI["CLI Layer (main.rs)"]
+        MAIN[main] --> CONF[Config]
+        MAIN --> GIT[Git Ops]
+        MAIN --> DIFF[Diff Engine]
+        MAIN --> PROMPT[Prompt Builder]
+        MAIN --> GEN[llama-swap Client]
+        MAIN --> VALID[Validator]
+        MAIN --> UI[StepTracker / Spinner]
+        MAIN --> DIALOG[Approval Dialog]
     end
 
-    %% Configuration Layer
-    subgraph Config["Configuration (config.rs)"]
-        ConfigLoad[Config::load()\nCascade: default → user → project]
-        ConfigValidate[Config::validate()]
-        Crypto[Crypto Module\nAES-256-GCM + Argon2id]
-        Scopes[Scope Definitions\nGlob patterns]
+    subgraph GitOps["Git Operations (git.rs)"]
+        GIT --> STAGED[get_staged_files]
+        GIT --> STATDIFF[get_staged_stat_and_diff]
+        GIT --> EXCLUDE[get_excluded_files]
+        GIT --> SCOPES[detect_scopes]
+        GIT --> COMMIT[git commit]
     end
 
-    %% Git Operations
-    subgraph Git["Git Operations (git.rs)"]
-        GetStaged[get_staged_files()]
-        GetStatDiff[get_staged_stat_and_diff()\n--stat + full diff]
-        DetectScopes[detect_scopes()\nGlob matching]
-        Excludes[get_excluded_files()\n:(exclude) patterns]
-        GitCommit[commit()\ngit commit -m]
+    subgraph DiffEngine["Diff Engine (diff.rs)"]
+        DIFF --> PARSE[parse_diff]
+        DIFF --> SCORE[score_file]
+        DIFF --> SELECT[select_strategy]
+        DIFF --> BUILD_CTX[build_*_context]
     end
 
-    %% Diff Processing
-    subgraph Diff["Diff Processing (diff.rs)"]
-        ParseDiff[parse_diff()\nSplit by file]
-        ScoreFile[score_file()\nPriority 0-100]
-        SelectStrategy[select_strategy()\nToken budget check]
-        
-        subgraph Strategies["Strategy Implementations"]
-            Direct[Direct\nFull diff in context]
-            Summarize[Summarize\nPer-file LLM summaries]
-            StatOnly[StatOnly\n--stat + top-N files]
-        end
-        
-        BuildDirect[build_direct_context()]
-        BuildSummary[build_summary_context()]
-        BuildStat[build_stat_context()]
+    subgraph LlamaSwap["llama-swap Client (llamaswap.rs)"]
+        GEN --> STREAM[generate_streaming]
+        GEN --> SUMMARIZE[summarize]
+        GEN --> TOKENIZE[tokenize / detokenize]
+        GEN --> VRAM[query_vram]
+        GEN --> CTX_LEN[model_ctx_len]
     end
 
-    %% LLM Client (llama-swap)
-    subgraph LLM["llama-swap Client (llamaswap.rs)"]
-        CreateClient[create_client()]
-        GenerateStream[generate_streaming()\nSSE streaming]
-        Summarize[summarize()\nPer-file summary]
-        Tokenize[tokenize() / detokenize()]
-        TokenCounts[token_counts()\nPrompt token budget]
-        ModelProps[model_props()\nn_ctx budget]
-        ApplyTemplate[apply_template()\nChat template]
-        QueryVRAM[query_vram()\nGPU stats]
-        RetryLogic[with_retry()\nExponential backoff]
+    subgraph PromptEngine["Prompt Builder (prompt.rs)"]
+        PROMPT --> COMMIT_PROMPT[build_commit_prompt]
+        PROMPT --> RETRY_PROMPT[build_retry_prompt]
+        PROMPT --> SUMMARY_PROMPT[build_file_summary_prompt]
+        PROMPT --> TEMPLATES[Askama Templates]
     end
 
-    %% Prompt Building
-    subgraph Prompt["Prompt Templates (prompt.rs)"]
-        CommitPrompt[build_commit_prompt()\nSystem + User]
-        SummaryPrompt[build_file_summary_prompt()]
-        RetryPrompt[build_retry_prompt()\nValidation feedback]
-        Templates[Askama Templates\ncommit_system.md, etc.]
+    subgraph Validation["Validation (validate.rs)"]
+        VALID --> REGEX[validate_conventional_commit]
+        VALID --> AUTOFIX[try_fix_commit_message]
     end
 
-    %% Validation & Stats
-    subgraph Validate["Validation (validate.rs)"]
-        ValidateConv[validate_conventional_commit()\nRegex + rules]
-        AutoFix[try_fix_commit_message()\nCapitalization, period]
-        MaxRetries[MAX_VALIDATION_RETRIES = 2]
+    subgraph UI2["UI (spinner.rs)"]
+        UI --> STEPTRACKER[StepTracker]
+        UI --> SUMBAR[summarize_bar]
+        UI --> SPIN[step_spinner]
     end
 
-    subgraph Stats["Generation Stats (stats.rs)"]
-        GenStats[GenerationStats\nTokens, timing, VRAM]
-        VRAMBar[VRAM Bar Visual\nUnicode blocks]
-        PrintStats[print()\nStyled output]
+    subgraph ConfigLayer["Config (config.rs)"]
+        CONF --> LOAD[load]
+        CONF --> DEFAULTS[default_excludes]
+        CONF --> SAVE[save_api_key]
     end
 
-    %% Spinner UI
-    subgraph Spinner["Progress UI (spinner.rs)"]
-        MultiProgress[MultiProgress\nShared draw target]
-        StepSpinner[Step Spinner]
-        SummarizeBar[Summarize Progress Bar]
-    end
-
-    %% Flow Connections
-    Main --> CliParse
-    Main --> LogInit
-    Main --> ConfigLoad
-    ConfigLoad --> Crypto
-    ConfigLoad --> ConfigValidate
-    ConfigLoad --> Scopes
-    
-    Main --> GetStaged
-    GetStaged --> GetStatDiff
-    GetStatDiff --> Excludes
-    GetStatDiff --> DetectScopes
-    DetectScopes --> Scopes
-    
-    GetStatDiff --> ParseDiff
-    ParseDiff --> ScoreFile
-    ScoreFile --> SelectStrategy
-    
-    SelectStrategy -->|fits| Direct
-    SelectStrategy -->|≤20 files| Summarize
-    SelectStrategy -->|>20 files| StatOnly
-    
-    Direct --> BuildDirect
-    Summarize --> BuildSummary
-    StatOnly --> BuildStat
-    
-    BuildDirect --> CommitPrompt
-    BuildSummary --> CommitPrompt
-    BuildStat --> CommitPrompt
-    
-    CommitPrompt --> GenerateStream
-    Summarize --> SummaryPrompt
-    SummaryPrompt --> Summarize
-    Summarize --> GenerateStream
-    
-    GenerateStream --> TokenCounts
-    TokenCounts --> ModelProps
-    GenerateStream --> QueryVRAM
-    GenerateStream --> RetryLogic
-    ApplyTemplate --> GenerateStream
-    
-    GenerateStream --> GenStats
-    GenStats --> PrintStats
-    GenStats --> VRAMBar
-    
-    GenerateStream --> ValidateConv
-    ValidateConv -->|fail ≤2| RetryPrompt
-    RetryPrompt --> GenerateStream
-    ValidateConv -->|fail 3rd| AutoFix
-    AutoFix --> ValidateConv
-    
-    ValidateConv -->|pass| ApprovalDialog
-    ApprovalDialog -->|Commit| GitCommit
-    ApprovalDialog -->|Edit| ApprovalDialog
-    ApprovalDialog -->|Abort| Main
-    
-    %% Styling
-    classDef entry fill:#e1f5fe,stroke:#01579b
-    classDef config fill:#f3e5f5,stroke:#4a148c
-    classDef git fill:#e8f5e9,stroke:#1b5e20
-    classDef diff fill:#fff3e0,stroke:#e65100
-    classDef llm fill:#fce4ec,stroke:#880e4f
-    classDef prompt fill:#ede7f6,stroke:#311b92
-    classDef validate fill:#f1f8e9,stroke:#33691e
-    classDef stats fill:#fff8e1,stroke:#f57f17
-    classDef ui fill:#f5f5f5,stroke:#424242
-    
-    class Main,CliParse,LogInit,ApprovalDialog entry
-    class ConfigLoad,ConfigValidate,Crypto,Scopes config
-    class GetStaged,GetStatDiff,DetectScopes,Excludes,GitCommit git
-    class ParseDiff,ScoreFile,SelectStrategy,Direct,Summarize,StatOnly,BuildDirect,BuildSummary,BuildStat diff
-    class CreateClient,GenerateStream,Summarize,Tokenize,TokenCounts,ModelProps,ApplyTemplate,QueryVRAM,RetryLogic llm
-    class CommitPrompt,SummaryPrompt,RetryPrompt,Templates prompt
-    class ValidateConv,AutoFix,MaxRetries validate
-    class GenStats,VRAMBar,PrintStats stats
-    class MultiProgress,StepSpinner,SummarizeBar ui
+    style CLI fill:#1a1a2e,stroke:#e94560,color:#fff
+    style GitOps fill:#16213e,stroke:#0f3460,color:#fff
+    style DiffEngine fill:#16213e,stroke:#0f3460,color:#fff
+    style LlamaSwap fill:#533483,stroke:#e94560,color:#fff
+    style PromptEngine fill:#533483,stroke:#0f3460,color:#fff
+    style Validation fill:#0f3460,stroke:#e94560,color:#fff
+    style UI2 fill:#1a1a2e,stroke:#533483,color:#fff
+    style ConfigLayer fill:#16213e,stroke:#533483,color:#fff
 ```
 
----
+## Execution Pipeline
 
-## Data Flow Summary
+The main pipeline follows these steps, driven by `StepTracker`:
 
-```
-┌─────────────┐     ┌─────────────┐     ┌─────────────┐
-│  git diff   │────▶│  parse_diff │────▶│ FileDiff[]  │
-│  --cached   │     │  (priority  │     │ (sorted by  │
-└─────────────┘     │   scored)   │     │  priority)  │
-                    └─────────────┘     └──────┬──────┘
-                                               │
-                    ┌──────────────────────────┼──────────────────────────┐
-                    ▼                          ▼                          ▼
-            ┌───────────────┐           ┌───────────────┐           ┌───────────────┐
-            │   Direct      │           │   Summarize   │           │   StatOnly    │
-            │  (tokens <    │           │  (files ≤ 20) │           │  (files > 20) │
-            │   n_ctx)      │           │               │           │               │
-            └───────┬───────┘           └───────┬───────┘           └───────┬───────┘
-                    │                           │                           │
-                    ▼                           ▼                           ▼
-            ┌───────────────┐           ┌───────────────┐           ┌───────────────┐
-            │build_direct_  │           │ For each file:│           │build_stat_    │
-            │context()      │           │  summarize()  │           │context()      │
-            └───────┬───────┘           └───────┬───────┘           └───────┬───────┘
-                    │                           │                           │
-                    └───────────────────────────┼───────────────────────────┘
-                                                ▼
-                                    ┌───────────────────────┐
-                                    │  build_commit_prompt  │
-                                    │  (system + user)      │
-                                    └───────────┬───────────┘
-                                                │
-                                                ▼
-                                    ┌───────────────────────┐
-                                    │  generate_streaming   │
-                                    │  (llama-swap SSE)     │
-                                    └───────────┬───────────┘
-                                                │
-                                                ▼
-                                    ┌───────────────────────┐
-                                    │  validate_conventional│
-                                    │  _commit() + retries  │
-                                    └───────────┬───────────┘
-                                                │
-                                                ▼
-                                    ┌───────────────────────┐
-                                    │  approval_dialog()    │
-                                    │  (commit/edit/abort)  │
-                                    └───────────┬───────────┘
-                                                │
-                                                ▼
-                                    ┌───────────────────────┐
-                                    │   git commit -m       │
-                                    └───────────────────────┘
+```mermaid
+flowchart TD
+    START([Start]) --> CONFIG[Load Config]
+    CONFIG --> APIKEY{API Key?}
+    APIKEY -->|From flag/env/file| CLIENT[Create HTTP Client]
+    APIKEY -->|Interactive prompt| SAVE[Save Key] --> CLIENT
+
+    CLIENT --> TRACKER[Create StepTracker]
+    TRACKER --> READ["1. Read Diff<br/>get_staged_stat_and_diff()"]
+    READ --> PARSE["2. Parse & Score<br/>parse_diff() → score_file()"]
+    PARSE --> STRAT["3. Select Strategy<br/>select_strategy()"]
+    STRAT --> DIRECT{Strategy?}
+
+    DIRECT -->|Direct| CTX_DIRECT[Use raw diff as context]
+    DIRECT -->|Summarize| SUMMARIZE["Summarize each file via API<br/>(separate progress bar)"]
+    DIRECT -->|StatOnly| CTX_STAT["Build stat-only context<br/>(top-N files by score)"]
+
+    CTX_DIRECT --> PROMPT_BUILD["4. Build Prompt<br/>build_commit_prompt()"]
+    SUMMARIZE --> PROMPT_BUILD
+    CTX_STAT --> PROMPT_BUILD
+
+    PROMPT_BUILD --> GENERATE["5. Generate Message<br/>generate_streaming()"]
+    GENERATE --> THINKING["thinking… phase<br/>(elapsed timer)"]
+    THINKING --> STREAMING["streaming phase<br/>(progress bar, tok/s)"]
+    STREAMING --> VALIDATE["6. Validate<br/>validate_conventional_commit()"]
+    VALIDATE --> VALID_OK{Valid?}
+
+    VALID_OK -->|Yes| APPROVE["7. Approval Dialog"]
+    VALID_OK -->|No, retries left| RETRY["Retry with error context<br/>build_retry_prompt()"]
+    RETRY --> GENERATE
+    VALID_OK -->|No, max retries| AUTOFIX["Auto-fix attempt<br/>try_fix_commit_message()"]
+    AUTOFIX --> APPROVE
+
+    APPROVE --> USER{User choice?}
+    USER -->|Commit| GIT_COMMIT["git commit"]
+    USER -->|Edit| EDITOR["$EDITOR → re-confirm"]
+    USER -->|Abort| ABORT([Exit])
+    EDITOR --> GIT_COMMIT
+    GIT_COMMIT --> DONE([Done])
 ```
 
----
+## Key Data Flow
 
-## Key Design Decisions
+```mermaid
+sequenceDiagram
+    participant User
+    participant CLI as main.rs
+    participant Git as git.rs
+    participant Diff as diff.rs
+    participant Prompt as prompt.rs
+    participant LLM as llamaswap.rs
+    participant Valid as validate.rs
 
-### 1. Three-Tier Diff Strategy
-- **Direct** path avoids extra LLM calls when diff fits
-- **Summarize** uses parallel-ish per-file calls (sequential with shared progress bar)
-- **StatOnly** caps at 20 files to avoid token explosion
+    User->>CLI: gac (staged changes)
+    CLI->>Git: get_staged_stat_and_diff()
+    Git-->>CLI: (stat, raw_diff)
 
-### 2. Priority Scoring Heuristics
-- Source files in `src/`/`lib/` = 90
-- Source files elsewhere = 75
-- Test files = 40
-- Config/docs = 20
-- Lock files = 0 (excluded)
+    CLI->>Diff: parse_diff(&raw_diff)
+    Diff-->>CLI: Vec<FileDiff> with scores
 
-### 3. Config Cascade (No `[model]` Nesting)
-- Flat TOML: `endpoint`, `model`, `max_completion_tokens` at root
-- Project config **replaces** user scopes entirely (no merge)
-- CLI only overrides `--model`
+    CLI->>Diff: select_strategy()
+    Note right of Diff: Direct if fits context,<br/>Summarize if >20 files,<br/>StatOnly for huge diffs
 
-### 4. Validation with Retry + Auto-Fix
-- Regex validates conventional commit format
-- Up to 2 retries with error context fed back to LLM
-- Auto-fix handles capitalization, trailing period
-- Final fallback: user edits in `$EDITOR` (default `nvim`)
+    CLI->>Prompt: build_commit_prompt(&context, &candidates)
+    Prompt-->>CLI: Prompt { system, user }
 
-### 5. llama-swap API (Not Ollama)
-- `/v1/chat/completions` with SSE streaming
-- `/tokenize`, `/detokenize`, `/props` for budget management
-- Retry with exponential backoff (max 3, base 500ms)
+    CLI->>LLM: generate_streaming(prompt)
+    LLM-->>CLI: SSE stream → (message, stats)
 
-### 6. Encrypted API Key Storage
-- AES-256-GCM + Argon2id (64MiB, 3 iterations)
-- Password from `GAC_ENCRYPTION_KEY` env or default
-- Stored in user config as `api_key_encrypted`
+    CLI->>Valid: validate_conventional_commit(&message)
+    alt Invalid + retries left
+        CLI->>Prompt: build_retry_prompt(reason)
+        CLI->>LLM: generate_streaming(retry_prompt)
+    end
 
----
+    CLI->>User: Show message + approval dialog
+    User->>CLI: Commit / Edit / Abort
+    CLI->>Git: git commit -m "..."
+```
+
+## Module Responsibilities
+
+| Module | Responsibility | Key Types |
+|--------|---------------|-----------|
+| `config.rs` | Load cascade (defaults → user → project), scope/exclude definitions | `Config`, `Scope`, `FileConfig` |
+| `diff.rs` | Parse unified diffs, score files by relevance, select generation strategy | `FileDiff`, `Strategy`, `ScopeMatch` |
+| `git.rs` | Shell out to `git` for staging info, scopes, exclusions, commits | — |
+| `llamaswap.rs` | HTTP client for llama-swap API: streaming chat, tokenize, VRAM query | `ChatChunk`, `GenerationStats`, `ModelInfo` |
+| `prompt.rs` | Assemble system+user messages from Askama templates | `Prompt`, `CommitSystem`, `ScopeTemplate` |
+| `spinner.rs` | `StepTracker` for pipeline progress, summarize bar, VRAM spinner | `StepTracker`, `StepState`, `Step` |
+| `stats.rs` | Format and display generation statistics | `GenerationStats` |
+| `validate.rs` | Regex validation of conventional commits, auto-fix heuristics | — |
+| `crypto.rs` | AES-256-GCM encryption for stored API keys | — |
+| `logging.rs` | `tracing` subscriber with custom formatter | `LogLevel` |
+
+## Diff Strategy Selection
+
+The strategy is chosen in `diff::select_strategy()` based on diff characteristics:
+
+| Strategy | When | Behavior |
+|----------|------|----------|
+| **Direct** | Diff fits within model context window | Full diff sent as prompt context |
+| **Summarize** | >20 files changed | Each file summarized individually via API call, summaries combined |
+| **StatOnly** | Extremely large diff | Only file names + stat output, top-N by relevance score |
+
+## Configuration Cascade
+
+Config is loaded in order, with later values overriding earlier ones:
+
+1. **Built-in defaults** (excluded file patterns, conventional commit types)
+2. **User config** (`~/.config/gac/config.toml`)
+3. **Project config** (`.gac.toml` in repo root)
+4. **CLI flags** (`--model` only)
+
+## Error Handling
+
+- All errors use `anyhow::Result<T>` with `bail!()` for early returns and `?` for propagation
+- No `unwrap()` on user input or network responses
+- Validation retries up to 2 times with error context before auto-fix fallback
+- Network errors in `generate_streaming` are retried with exponential backoff via `with_retry()`
 
 ## Testing
 
-```bash
-cargo test                    # All tests
-cargo test diff               # Diff module tests
-cargo test diff::tests::test_parse_diff_single_file  # Single test
-cargo test -- --nocapture     # With stdout
-```
-
-Key test modules:
-- `diff.rs` — scoring, parsing, context builders, strategy selection
-- `git.rs` — scope detection, exclude patterns
-- `prompt.rs` — template rendering, retry prompts
-- `validate.rs` — conventional commit validation, auto-fix
-- `llamaswap.rs` — tokenization, chunk parsing, message building
-
----
-
-## Extending the Architecture
-
-| Extension Point | Location | Notes |
-|-----------------|----------|-------|
-| New diff strategy | `diff.rs::Strategy` enum | Add variant + handler in `main.rs` |
-| New prompt template | `templates/*.md` + `prompt.rs` | Askama compiles at build time |
-| New validation rule | `validate.rs` | Add to regex or `try_fix_commit_message` |
-| New LLM endpoint | `llamaswap.rs` | Follow existing retry/streaming patterns |
-| New config field | `config.rs::FileConfig` + `Config` | Add to cascade in `apply_file` |
-
----
-
-*Generated from GitNexus code analysis (379 symbols, 681 relationships, 33 execution flows)*
+57 unit tests covering:
+- `diff.rs`: parsing, scoring, context building, strategy display
+- `git.rs`: scope detection, exclusion building, candidate selection
+- `llamaswap.rs`: SSE chunk deserialization, message building
+- `prompt.rs`: prompt construction with templates and scopes
+- `validate.rs`: conventional commit regex, auto-fix heuristics

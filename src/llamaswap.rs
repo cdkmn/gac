@@ -5,7 +5,12 @@ pub use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::{config::Config, prompt::Prompt, spinner, stats::GenerationStats};
+use crate::{
+    config::Config,
+    prompt::Prompt,
+    spinner::{self, StepTracker},
+    stats::GenerationStats,
+};
 
 const MAX_API_RETRIES: usize = 2;
 const INITIAL_RETRY_DELAY_MS: u64 = 1000;
@@ -25,13 +30,14 @@ struct ChatRequest {
 }
 
 #[derive(Deserialize)]
-pub struct DefaultGenerationSettings {
-    pub n_ctx: u32,
+pub struct ModelInfo {
+    pub id: String,
+    pub context_length: Option<u64>,
 }
 
 #[derive(Deserialize)]
 pub struct ModelPropResponse {
-    pub default_generation_settings: DefaultGenerationSettings,
+    pub data: Vec<ModelInfo>,
 }
 
 #[derive(Serialize, Clone)]
@@ -88,14 +94,10 @@ struct ChatChunkChoice {
 
 #[derive(Deserialize)]
 struct ChatChunkTimings {
-    // cache_n: u64,
     prompt_n: u64,
     prompt_ms: f64,
-    // prompt_per_token_ms: f64,
-    // prompt_per_second: f64,
     predicted_n: u64,
     predicted_ms: f64,
-    // predicted_per_token_ms: f64,
     predicted_per_second: f64,
 }
 
@@ -109,7 +111,6 @@ struct ChatChunk {
 
 #[derive(Deserialize)]
 struct ChatResChoiceMsg {
-    // role: String,
     content: Option<String>,
 }
 
@@ -231,7 +232,9 @@ pub async fn generate_streaming(
     client: &Client,
     config: &Config,
     prompt: &Prompt,
+    steps: &mut StepTracker,
     mp: &MultiProgress,
+    quiet: bool,
 ) -> Result<(String, GenerationStats)> {
     let req = ChatRequest {
         model: config.model.clone(),
@@ -246,8 +249,15 @@ pub async fn generate_streaming(
         user = truncate_for_debug(&prompt.user)
     );
 
-    // Start spinner before the network call so latency is always covered
-    let spin = spinner::generation_spinner(mp, &config.model);
+    // Live progress bar (suppressed in quiet mode, where only the commit
+    // message should reach stdout). It starts in a "wait" phase showing the
+    // elapsed timer, then transitions into a streaming % bar.
+    if !quiet {
+        steps.generate_thinking();
+    }
+    let start = std::time::Instant::now();
+    let mut output_tokens: u64 = 0;
+    let mut smoothed_tps: f64 = 0.0;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
 
     let response = with_retry(|| {
@@ -261,7 +271,9 @@ pub async fn generate_streaming(
     let response = match response {
         Ok(r) => r,
         Err(e) => {
-            spinner::fail(&spin, format!("request failed: {e}"));
+            if !quiet {
+                steps.generate_done(0, 0.0, start.elapsed());
+            }
             return Err(e);
         }
     };
@@ -272,7 +284,15 @@ pub async fn generate_streaming(
     let mut line_buffer = String::new();
 
     while let Some(chunk) = stream.next().await {
-        let bytes = chunk?;
+        let bytes = match chunk {
+            Ok(b) => b,
+            Err(e) => {
+                if !quiet {
+                    steps.generate_done(0, 0.0, start.elapsed());
+                }
+                return Err(e.into());
+            }
+        };
         line_buffer.push_str(&String::from_utf8_lossy(&bytes));
 
         // Process all complete lines; leave any trailing partial line in the buffer.
@@ -298,15 +318,37 @@ pub async fn generate_streaming(
 
             for choice in parsed.choices {
                 if first_token {
-                    // Clear the spinner before printing anything to stdout
+                    // Clear the thinking spinner before printing to stdout
                     // so the two streams don't interleave visually.
-                    spinner::clear(&spin);
                     print!("\n💬 ");
                     first_token = false;
                 }
                 match choice.finish_reason {
                     None => {
-                        result.push_str(choice.delta.content.unwrap_or_default().as_str());
+                        let content = choice.delta.content.unwrap_or_default();
+                        result.push_str(&content);
+                        // Approximate output tokens incrementally for the live
+                        // % estimate; the real count arrives in the finish chunk.
+                        output_tokens += content.chars().count() as u64;
+                        if !quiet {
+                            let elapsed = start.elapsed();
+                            let inst_tps = output_tokens as f64 / elapsed.as_secs_f64().max(1e-3);
+                            const ALPHA: f64 = 0.2;
+                            smoothed_tps = if smoothed_tps == 0.0 {
+                                inst_tps
+                            } else {
+                                ALPHA * inst_tps + (1.0 - ALPHA) * smoothed_tps
+                            };
+                            let pct = if config.max_completion_tokens > 0 {
+                                ((output_tokens as f64 / config.max_completion_tokens as f64
+                                    * 100.0)
+                                    .round() as u64)
+                                    .min(100)
+                            } else {
+                                0
+                            };
+                            steps.generate_streaming(pct, output_tokens, smoothed_tps, elapsed);
+                        }
                     }
                     _ => {
                         if let Some(timings) = &parsed.timings {
@@ -325,10 +367,17 @@ pub async fn generate_streaming(
 
     // Always ensure a clean line after streaming, whether we got tokens or not
     if !first_token {
+        // Snap the live bar to 100% (if the real count is known) so it never
+        // ends on a stale percentage, then release the stderr line.
+        if !quiet {
+            steps.generate_done(stats.output_tokens, smoothed_tps, start.elapsed());
+        }
         println!();
     } else {
-        // No tokens arrived at all — clean up the spinner as an error
-        spinner::fail(&spin, "no response received from model");
+        // No tokens arrived at all — clean up the bar as an error
+        if !quiet {
+            steps.generate_done(0, 0.0, start.elapsed());
+        }
     }
 
     // VRAM query after streaming — best-effort, never blocks the happy path
@@ -345,20 +394,27 @@ pub async fn generate_streaming(
     Ok((result.trim().to_string(), stats))
 }
 
-/// Model props.
-pub async fn model_props(client: &Client, config: &Config) -> Result<ModelPropResponse> {
+/// Get the maximum context length for a given model
+pub async fn model_ctx_len(client: &Client, config: &Config) -> Result<u64> {
     debug!(model= %config.model, "sending model props request");
 
     let response = check_response(
         client
-            .get(format!("{}/props?model={}", config.endpoint, config.model))
+            .get(format!("{}/v1/models", config.endpoint))
             .send()
             .await?,
     )
     .await?;
     let body: ModelPropResponse = response.json().await?;
+    let Some(len) = body.data.iter().find_map(|mi| {
+        mi.id
+            .eq(&config.model)
+            .then(|| mi.context_length.unwrap_or(131072))
+    }) else {
+        anyhow::bail!("Model not found");
+    };
 
-    Ok(body)
+    Ok(len)
 }
 
 /// Apply the modeltemplate to the prompt and send it to the model for token counts.

@@ -216,6 +216,11 @@ async fn main() -> Result<()> {
 
     // ── Shared MultiProgress — all spinners/bars share one instance ───────
     let mp = spinner::multi();
+    let mut steps = if cli.quiet || cli.print {
+        None
+    } else {
+        Some(spinner::StepTracker::new(&mp, config.max_completion_tokens))
+    };
 
     // ── Staged files ──────────────────────────────────────────────────────
     let all_staged = git::get_staged_files()?;
@@ -245,26 +250,24 @@ async fn main() -> Result<()> {
     }
 
     // ── Raw diff ──────────────────────────────────────────────────────────
-    let diff_spin = spinner::step_spinner(&mp, "Reading staged diff…");
-    let (stat, raw_diff) =
-        git::get_staged_stat_and_diff(&config.exclude_patterns).inspect_err(|e| {
-            spinner::fail(&diff_spin, e.to_string());
-        })?;
-    spinner::done(
-        &diff_spin,
-        format!(
-            "read diff — {} chars across {} file(s)",
-            raw_diff.len(),
-            raw_diff
-                .lines()
-                .filter(|l| l.starts_with("diff --git"))
-                .count()
-        ),
-    );
+    let (stat, raw_diff) = git::get_staged_stat_and_diff(&config.exclude_patterns)?;
+    if let Some(ref mut steps) = steps {
+        let file_count = raw_diff
+            .lines()
+            .filter(|l| l.starts_with("diff --git"))
+            .count();
+        steps.finish(format!("{} files, {} chars", file_count, raw_diff.len()));
+    }
     let file_diffs = diff::parse_diff(&raw_diff);
+    if let Some(ref mut steps) = steps {
+        steps.finish(format!("{} files scored", file_diffs.len()));
+    }
     let (strategy, ctx) = diff::select_strategy(&client, &config, &raw_diff, &scope_match, &stat)
         .await
         .context("failed to select diff strategy")?;
+    if let Some(ref mut steps) = steps {
+        steps.finish(format!("{}", strategy));
+    }
 
     info!(
         diff_chars = raw_diff.len(),
@@ -281,10 +284,9 @@ async fn main() -> Result<()> {
 
             // One shared progress bar for the whole summarize pass
             let bar = spinner::summarize_bar(&mp, file_diffs.len());
-            let props = llamaswap::model_props(&client, &config)
+            let budget = llamaswap::model_ctx_len(&client, &config)
                 .await
                 .context("failed to fetch model properties")?;
-            let budget = props.default_generation_settings.n_ctx;
             let mut summaries: HashMap<String, String> = HashMap::new();
             let mut completed = 0u64;
 
@@ -347,6 +349,9 @@ async fn main() -> Result<()> {
     // ── Generate commit message ───────────────────────────────────────────
     let candidates = scope_match.best_candidates();
     let commit_prompt = prompt::build_commit_prompt(&context, &candidates);
+    if let Some(ref mut steps) = steps {
+        steps.finish("prompt built");
+    }
 
     info!(
         model   = %config.model,
@@ -355,10 +360,28 @@ async fn main() -> Result<()> {
 
     // mp is passed in so the generation spinner shares the same draw target
     // as any bars that were active during the summarize pass.
-    let (mut message, gen_stats) =
-        llamaswap::generate_streaming(&client, &config, &commit_prompt, &mp).await?;
-    // Print stats immediately after generation, before the approval dialog
-    gen_stats.print();
+    let (mut message, gen_stats) = if let Some(ref mut steps) = steps {
+        llamaswap::generate_streaming(&client, &config, &commit_prompt, steps, &mp, cli.quiet)
+            .await?
+    } else {
+        // In quiet/print mode, create a temporary step tracker just for the call
+        let mut temp_steps = spinner::StepTracker::new(&mp, config.max_completion_tokens);
+        temp_steps.clear();
+        llamaswap::generate_streaming(
+            &client,
+            &config,
+            &commit_prompt,
+            &mut temp_steps,
+            &mp,
+            cli.quiet,
+        )
+        .await?
+    };
+    // Print stats immediately after generation, before the approval dialog.
+    // In quiet mode the live bar is already suppressed, so keep stderr quiet too.
+    if !cli.quiet {
+        gen_stats.print();
+    }
 
     // ── Validate and auto-retry if needed ─────────────────────────────────
     const MAX_VALIDATION_RETRIES: usize = 2;
@@ -366,9 +389,17 @@ async fn main() -> Result<()> {
 
     loop {
         match validate::validate_conventional_commit(&message) {
-            Ok(()) => break,
+            Ok(()) => {
+                if let Some(ref mut steps) = steps {
+                    steps.finish("passed");
+                }
+                break;
+            }
             Err(reason) if retries < MAX_VALIDATION_RETRIES => {
                 retries += 1;
+                if let Some(ref mut steps) = steps {
+                    steps.show_retry(format!("retry {}/{}", retries, MAX_VALIDATION_RETRIES));
+                }
                 warn!(
                     reason,
                     message = &message,
@@ -378,20 +409,54 @@ async fn main() -> Result<()> {
 
                 let retry_prompt =
                     prompt::build_retry_prompt(&context, &candidates, &message, &reason);
-                let (retry_msg, _) =
-                    llamaswap::generate_streaming(&client, &config, &retry_prompt, &mp).await?;
+                let (retry_msg, retry_stats) = if let Some(ref mut steps) = steps {
+                    llamaswap::generate_streaming(
+                        &client,
+                        &config,
+                        &retry_prompt,
+                        steps,
+                        &mp,
+                        cli.quiet,
+                    )
+                    .await?
+                } else {
+                    let mut temp_steps =
+                        spinner::StepTracker::new(&mp, config.max_completion_tokens);
+                    temp_steps.clear();
+                    llamaswap::generate_streaming(
+                        &client,
+                        &config,
+                        &retry_prompt,
+                        &mut temp_steps,
+                        &mp,
+                        cli.quiet,
+                    )
+                    .await?
+                };
+                if !cli.quiet {
+                    retry_stats.print_quiet_summary();
+                }
                 message = retry_msg;
             }
             Err(reason) => {
+                if let Some(ref mut steps) = steps {
+                    steps.finish(format!("failed: {}", reason));
+                }
                 warn!(
                     reason,
                     "commit message validation failed after retries — attempting auto-fix"
                 );
                 let fixed = validate::try_fix_commit_message(&message);
                 if validate::validate_conventional_commit(&fixed).is_ok() {
+                    if let Some(ref mut steps) = steps {
+                        steps.finish("auto-fixed");
+                    }
                     info!("auto-fix succeeded");
                     message = fixed;
                 } else {
+                    if let Some(ref mut steps) = steps {
+                        steps.finish("manual edit required");
+                    }
                     warn!("auto-fix failed — user will need to edit manually");
                 }
                 break;
@@ -400,6 +465,9 @@ async fn main() -> Result<()> {
     }
 
     // ── Approval + commit ─────────────────────────────────────────────────
+    if let Some(ref steps) = steps {
+        steps.clear();
+    }
     let final_message = if cli.print {
         // Print-only mode: output to stdout and exit
         println!("{message}");
@@ -444,6 +512,9 @@ async fn main() -> Result<()> {
 
     debug!(message = %final_message, "running git commit");
     if git::commit(&final_message, cli.no_verify)? {
+        if let Some(ref mut steps) = steps {
+            steps.finish("done");
+        }
         info!("committed successfully");
     } else {
         anyhow::bail!("git commit failed");
