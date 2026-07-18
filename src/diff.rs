@@ -167,13 +167,13 @@ fn extract_path(line: &str) -> String {
 pub async fn select_strategy(
     client: &llamaswap::Client,
     config: &Config,
-    raw_diff: &str,
+    _raw_diff: &str,
+    file_diffs: &[FileDiff],
     scope_match: &ScopeMatch,
     stat: &str,
 ) -> anyhow::Result<(Strategy, String)> {
     let mut budget = llamaswap::model_ctx_len(client, config).await?;
-    let files = parse_diff(raw_diff);
-    let body = build_direct_context(&files);
+    let body = build_direct_context(file_diffs);
     let context = format!("=== Stat ===\n{stat}\n=== Diff ===\n{body}");
     let candidates = scope_match.best_candidates();
     let commit_prompt = prompt::build_commit_prompt(&context, &candidates);
@@ -181,7 +181,7 @@ pub async fn select_strategy(
 
     debug!(
         tokens = tokens,
-        file_count = files.len(),
+        file_count = file_diffs.len(),
         budget = budget,
         "selecting diff strategy"
     );
@@ -190,14 +190,14 @@ pub async fn select_strategy(
         return Ok((Strategy::Direct, context));
     }
 
-    if files.len() <= SUMMARIZE_THRESHOLD {
+    if file_diffs.len() <= SUMMARIZE_THRESHOLD {
         return Ok((Strategy::Summarize, "".to_string()));
     }
 
     // How many top-priority files can we fit in the budget?
     let mut top_n = 0;
 
-    for f in files {
+    for f in file_diffs {
         let tokens = llamaswap::tokenize(client, config, &f.content).await?;
 
         if tokens.len() > budget as usize {
