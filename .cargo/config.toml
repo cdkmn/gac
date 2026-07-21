@@ -1,2 +1,9 @@
-[target.'cfg(all())']
+[build]
+rustc-wrapper = "sccache"
+
+[target."cfg(all())"]
+linker = "rust-lld.exe"
 rustflags = ["-W", "unused-crate-dependencies"]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-Ctarget-feature=+crt-static"]
