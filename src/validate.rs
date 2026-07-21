@@ -1,5 +1,4 @@
 use std::sync::LazyLock;
-use tracing::{debug, warn};
 
 static CONVENTIONAL_RE: LazyLock<regex::Regex> = LazyLock::new(|| {
     regex::Regex::new(
@@ -69,13 +68,15 @@ pub fn validate_conventional_commit(message: &str) -> Result<(), String> {
     if let Some(subject) = first_line.split_once(": ").map(|x| x.1) {
         if let Some(first_char) = subject.chars().next() {
             if first_char.is_uppercase() {
-                warn!("subject starts with uppercase letter");
+                println!(
+                    "⚠️ {}",
+                    console::style("Subject starts with uppercase letter").yellow()
+                );
                 // This is a warning, not an error — some teams prefer uppercase
             }
         }
     }
 
-    debug!("commit message validation passed");
     Ok(())
 }
 
@@ -133,7 +134,6 @@ pub fn try_fix_commit_message(message: &str) -> String {
                 result.push_str(&remaining_lines.join("\n"));
             }
 
-            debug!(original = %first_line, fixed = %result.lines().next().unwrap_or(""), "auto-fixed commit message");
             return result;
         }
     }
