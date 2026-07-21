@@ -4,7 +4,7 @@
 endpoint = "http://localhost:11438"
 
 # Model name for generation
-model = "Gemma-4:E4B-QAT"
+model = "Gemma-4:E4B-QAT" #"Sweep-Next:1.5B"
 
 # An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens
 max_completion_tokens = 4096
