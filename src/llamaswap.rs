@@ -1,16 +1,11 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use futures_util::StreamExt;
-use indicatif::MultiProgress;
 pub use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
 
-use crate::{
-    config::Config,
-    prompt::Prompt,
-    spinner::{self, StepTracker},
-    stats::GenerationStats,
-};
+use crate::{config::Config, progress::Progress, prompt::Prompt, stats::GenerationStats};
 
 const MAX_API_RETRIES: usize = 2;
 const INITIAL_RETRY_DELAY_MS: u64 = 1000;
@@ -84,6 +79,7 @@ enum FinishReason {
 #[derive(Deserialize)]
 struct ChatChunkDelta {
     content: Option<String>,
+    reasoning_content: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,8 +97,6 @@ struct ChatChunkTimings {
     predicted_per_second: f64,
 }
 
-// llama-swap emits one JSON object per line.
-// The final chunk (done=true) carries all the stat fields.
 #[derive(Deserialize, Default)]
 struct ChatChunk {
     choices: Vec<ChatChunkChoice>,
@@ -140,15 +134,10 @@ struct PerformanceRes {
 
 // ── Helpers ───────────────────────────────────────────────────────────────
 
-/// Truncate a string for debug logging, avoiding panics on short strings.
-fn truncate_for_debug(s: &str) -> String {
-    s.chars().take(30).collect::<String>()
-}
-
 /// Create a reusable HTTP client with sensible defaults.
 /// If `api_key` is provided, all requests will include `Authorization: Bearer <key>`.
 pub fn create_client(api_key: Option<&str>) -> Client {
-    let mut builder = Client::builder().timeout(std::time::Duration::from_secs(300));
+    let mut builder = Client::builder().timeout(Duration::from_secs(300));
 
     if let Some(key) = api_key {
         let mut headers = reqwest::header::HeaderMap::new();
@@ -156,7 +145,6 @@ pub fn create_client(api_key: Option<&str>) -> Client {
             .expect("valid Authorization header value");
         headers.insert(reqwest::header::AUTHORIZATION, value);
         builder = builder.default_headers(headers);
-        debug!("API key loaded — requests will include Authorization header");
     }
 
     builder.build().expect("failed to create HTTP client")
@@ -191,11 +179,9 @@ async fn check_response(response: reqwest::Response) -> Result<reqwest::Response
 async fn query_vram(client: &Client, endpoint: &str, now: &str) -> Option<PerfGpuStat> {
     let url = format!("{endpoint}/api/performance?after={now}");
     let Ok(resp) = client.get(&url).send().await else {
-        warn!("could not reach /api/performance — VRAM stats unavailable");
         return None;
     };
     let Ok(ps) = resp.json::<PerformanceRes>().await else {
-        warn!("failed to parse /api/performance response — VRAM stats unavailable");
         return None;
     };
 
@@ -215,11 +201,10 @@ where
     loop {
         match operation().await {
             Ok(result) => return Ok(result),
-            Err(e) if attempt < MAX_API_RETRIES => {
+            Err(_) if attempt < MAX_API_RETRIES => {
                 attempt += 1;
                 let delay_ms = INITIAL_RETRY_DELAY_MS * 2u64.pow(attempt as u32 - 1);
-                warn!(attempt, delay_ms, error = %e, "API call failed — retrying");
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             }
             Err(e) => return Err(e),
         }
@@ -232,9 +217,7 @@ pub async fn generate_streaming(
     client: &Client,
     config: &Config,
     prompt: &Prompt,
-    steps: &mut StepTracker,
-    mp: &MultiProgress,
-    quiet: bool,
+    prog: &Progress,
 ) -> Result<(String, GenerationStats)> {
     let req = ChatRequest {
         model: config.model.clone(),
@@ -243,21 +226,6 @@ pub async fn generate_streaming(
         max_completion_tokens: Some(config.max_completion_tokens),
     };
 
-    info!(model = %config.model, "sending chat request");
-    debug!(
-        system = truncate_for_debug(&prompt.system),
-        user = truncate_for_debug(&prompt.user)
-    );
-
-    // Live progress bar (suppressed in quiet mode, where only the commit
-    // message should reach stdout). It starts in a "wait" phase showing the
-    // elapsed timer, then transitions into a streaming % bar.
-    if !quiet {
-        steps.generate_thinking();
-    }
-    let start = std::time::Instant::now();
-    let mut output_tokens: u64 = 0;
-    let mut smoothed_tps: f64 = 0.0;
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
 
     let response = with_retry(|| {
@@ -271,9 +239,6 @@ pub async fn generate_streaming(
     let response = match response {
         Ok(r) => r,
         Err(e) => {
-            if !quiet {
-                steps.generate_done(0, 0.0, start.elapsed());
-            }
             return Err(e);
         }
     };
@@ -287,9 +252,6 @@ pub async fn generate_streaming(
         let bytes = match chunk {
             Ok(b) => b,
             Err(e) => {
-                if !quiet {
-                    steps.generate_done(0, 0.0, start.elapsed());
-                }
                 return Err(e.into());
             }
         };
@@ -318,37 +280,29 @@ pub async fn generate_streaming(
 
             for choice in parsed.choices {
                 if first_token {
-                    // Clear the thinking spinner before printing to stdout
-                    // so the two streams don't interleave visually.
-                    print!("\n💬 ");
                     first_token = false;
                 }
+
                 match choice.finish_reason {
                     None => {
+                        let reasoning = choice
+                            .delta
+                            .reasoning_content
+                            .unwrap_or_default()
+                            .replace("\n", "")
+                            .replace("\r", "");
                         let content = choice.delta.content.unwrap_or_default();
-                        result.push_str(&content);
-                        // Approximate output tokens incrementally for the live
-                        // % estimate; the real count arrives in the finish chunk.
-                        output_tokens += content.chars().count() as u64;
-                        if !quiet {
-                            let elapsed = start.elapsed();
-                            let inst_tps = output_tokens as f64 / elapsed.as_secs_f64().max(1e-3);
-                            const ALPHA: f64 = 0.2;
-                            smoothed_tps = if smoothed_tps == 0.0 {
-                                inst_tps
-                            } else {
-                                ALPHA * inst_tps + (1.0 - ALPHA) * smoothed_tps
-                            };
-                            let pct = if config.max_completion_tokens > 0 {
-                                ((output_tokens as f64 / config.max_completion_tokens as f64
-                                    * 100.0)
-                                    .round() as u64)
-                                    .min(100)
-                            } else {
-                                0
-                            };
-                            steps.generate_streaming(pct, output_tokens, smoothed_tps, elapsed);
+                        let clean_content = &content.replace("\n", "").replace("\r", "");
+
+                        if !reasoning.trim().is_empty() {
+                            prog.set_msg_generation(&reasoning, true);
                         }
+
+                        if !clean_content.trim().is_empty() {
+                            prog.set_msg_generation(clean_content, false);
+                        }
+
+                        result.push_str(&content);
                     }
                     _ => {
                         if let Some(timings) = &parsed.timings {
@@ -365,25 +319,55 @@ pub async fn generate_streaming(
         }
     }
 
-    // Always ensure a clean line after streaming, whether we got tokens or not
-    if !first_token {
-        // Snap the live bar to 100% (if the real count is known) so it never
-        // ends on a stale percentage, then release the stderr line.
-        if !quiet {
-            steps.generate_done(stats.output_tokens, smoothed_tps, start.elapsed());
-        }
-        println!();
-    } else {
-        // No tokens arrived at all — clean up the bar as an error
-        if !quiet {
-            steps.generate_done(0, 0.0, start.elapsed());
+    // Final flush: process any remaining content in the line buffer
+    if !line_buffer.is_empty() {
+        for line in line_buffer.lines() {
+            let line = line.trim();
+
+            if line.is_empty() || line == "data: [DONE]" {
+                continue;
+            }
+
+            if let Some(json_str) = line.strip_prefix("data: ") {
+                if let Ok(parsed) = serde_json::from_str::<ChatChunk>(json_str) {
+                    for choice in parsed.choices {
+                        let reasoning = choice
+                            .delta
+                            .reasoning_content
+                            .unwrap_or_default()
+                            .replace("\n", "")
+                            .replace("\r", "");
+                        let content = choice.delta.content.unwrap_or_default();
+                        let clean_content = &content.replace("\n", "").replace("\r", "");
+
+                        if !reasoning.trim().is_empty() {
+                            prog.set_msg_generation(&reasoning, true);
+                        }
+
+                        if !clean_content.trim().is_empty() {
+                            prog.set_msg_generation(clean_content, false);
+                        }
+
+                        if !content.is_empty() {
+                            result.push_str(&content);
+                        }
+
+                        if let Some(timings) = &parsed.timings {
+                            stats.input_tokens = timings.prompt_n;
+                            stats.output_tokens = timings.predicted_n;
+                            stats.prompt_eval_ms = timings.prompt_ms;
+                            stats.eval_ms = timings.predicted_ms;
+                            stats.total_ms = stats.prompt_eval_ms + stats.eval_ms;
+                            stats.tokens_per_second = timings.predicted_per_second;
+                        }
+                    }
+                }
+            }
         }
     }
 
     // VRAM query after streaming — best-effort, never blocks the happy path
-    let vram_spin = spinner::step_spinner(mp, "querying VRAM usage…");
     let gpu_stat = query_vram(client, &config.endpoint, &now).await;
-    spinner::clear(&vram_spin);
 
     if let Some(gpu_stat) = gpu_stat {
         stats.vram_total_mb = Some(gpu_stat.mem_total_mb);
@@ -396,8 +380,6 @@ pub async fn generate_streaming(
 
 /// Get the maximum context length for a given model
 pub async fn model_ctx_len(client: &Client, config: &Config) -> Result<u64> {
-    debug!(model= %config.model, "sending model props request");
-
     let response = check_response(
         client
             .get(format!("{}/v1/models", config.endpoint))
@@ -417,14 +399,8 @@ pub async fn model_ctx_len(client: &Client, config: &Config) -> Result<u64> {
     Ok(len)
 }
 
-/// Apply the modeltemplate to the prompt and send it to the model for token counts.
+/// Apply the model template to the prompt and send it to the model for token counts.
 pub async fn apply_template(client: &Client, config: &Config, prompt: &Prompt) -> Result<String> {
-    debug!(model= %config.model, "sending apply template request");
-    debug!(
-        system = truncate_for_debug(&prompt.system),
-        user = truncate_for_debug(&prompt.user)
-    );
-
     let req = ApplyTemplateRequest {
         messages: build_messages(prompt),
     };
@@ -447,8 +423,6 @@ pub async fn apply_template(client: &Client, config: &Config, prompt: &Prompt) -
 
 /// Tokenize a string into token IDs using the model's tokenizer.
 pub async fn tokenize(client: &Client, config: &Config, content: &str) -> Result<Vec<u32>> {
-    debug!(model= %config.model,"sending tokenize request");
-
     let req = TokenizeRequest {
         content: content.to_string(),
     };
@@ -470,8 +444,6 @@ pub async fn tokenize(client: &Client, config: &Config, content: &str) -> Result
 
 /// Convert token IDs back to text using the model's tokenizer.
 pub async fn detokenize(client: &Client, config: &Config, tokens: &[u32]) -> Result<String> {
-    debug!(model= %config.model,"sending detokenize request");
-
     let req = DetokenizeRequest {
         tokens: tokens.to_vec(),
     };
@@ -501,15 +473,6 @@ pub async fn token_counts(client: &Client, config: &Config, prompt: &Prompt) -> 
 /// Summarize a single file diff. Returns text only — stats are not shown
 /// for the per-file pass to keep the progress display clean.
 pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Result<String> {
-    debug!(
-        model    = %config.model,
-        "sending summarize request (non-streaming)"
-    );
-    debug!(
-        system = truncate_for_debug(&prompt.system),
-        user = truncate_for_debug(&prompt.user)
-    );
-
     let req = ChatRequest {
         model: config.model.clone(),
         messages: build_messages(prompt),
@@ -543,21 +506,6 @@ pub async fn summarize(client: &Client, config: &Config, prompt: &Prompt) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── truncate_for_debug ────────────────────────────────────────────────
-
-    #[test]
-    fn truncate_short_string_unchanged() {
-        assert_eq!(truncate_for_debug("hi"), "hi");
-    }
-
-    #[test]
-    fn truncate_long_string_is_limited() {
-        let long = "a".repeat(100);
-        let result = truncate_for_debug(&long);
-        assert_eq!(result.len(), 30);
-        assert_eq!(result, "a".repeat(30));
-    }
 
     // ── build_messages ───────────────────────────────────────────────────
 
