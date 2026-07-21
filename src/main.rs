@@ -5,19 +5,17 @@ mod crypto;
 mod diff;
 mod git;
 mod llamaswap;
-mod logging;
+mod progress;
 mod prompt;
-mod spinner;
 mod stats;
 mod validate;
+
+use std::{collections::HashMap, fs, path::Path, process::Stdio, time::Instant};
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use config::Config;
 use diff::Strategy;
-use logging::LogLevel;
-use std::{collections::HashMap, path::Path};
-use tracing::{debug, info, warn};
 
 const DEFAULT_CONFIG: &str = include_str!("../templates/gac.toml");
 
@@ -49,22 +47,6 @@ struct Cli {
     #[arg(long, env = "GAC_API_KEY")]
     api_key: Option<String>,
 
-    /// Show info-level messages: config paths, strategy selection, scope detection
-    #[arg(short, long, conflicts_with = "debug")]
-    verbose: bool,
-
-    /// Show debug-level messages: API fields, per-chunk details, raw config
-    #[arg(long, conflicts_with = "verbose")]
-    debug: bool,
-
-    /// Suppress all output except the commit message and errors
-    #[arg(short, long, conflicts_with = "verbose", conflicts_with = "debug")]
-    quiet: bool,
-
-    /// Print the generated message to stdout and exit without committing
-    #[arg(long)]
-    print: bool,
-
     /// Pass --no-verify to git commit (skip pre-commit hooks)
     #[arg(long)]
     no_verify: bool,
@@ -77,11 +59,20 @@ fn init_config() -> Result<()> {
         anyhow::bail!("{path} already exists.");
     }
 
-    std::fs::write(path, DEFAULT_CONFIG)?;
+    fs::write(path, DEFAULT_CONFIG)?;
 
-    info!(path, "project config created");
+    println!("Configuration created at {}", console::style(path).yellow());
 
     Ok(())
+}
+
+fn command_exists(cmd: &str) -> bool {
+    std::process::Command::new(cmd)
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok()
 }
 
 fn approval_dialog(message: &str) -> anyhow::Result<Approval> {
@@ -93,19 +84,12 @@ fn approval_dialog(message: &str) -> anyhow::Result<Approval> {
     // Show the generated message clearly before asking anything.
     println!(
         "\n{}\n",
-        dialoguer::console::style("── Generated commit message ──").dim()
+        console::style(format!("── Generated Commit Message {}", "─".repeat(27))).dim()
     );
     println!("{message}");
-    println!(
-        "{}",
-        dialoguer::console::style("─────────────────────────────").dim()
-    );
+    println!("{}", console::style("─".repeat(55)).dim());
 
-    let choices = &[
-        "✅  Commit — use this message",
-        "✏️   Edit  — open in $EDITOR",
-        "✗   Abort — discard",
-    ];
+    let choices = &["✅ Commit", "✏️ Edit", "❌ Abort"];
     let selection = Select::with_theme(&theme)
         .with_prompt("What would you like to do?")
         .items(choices)
@@ -115,12 +99,20 @@ fn approval_dialog(message: &str) -> anyhow::Result<Approval> {
     match selection {
         Some(0) => Ok(Approval::Commit),
         Some(1) => {
-            // Open $EDITOR pre-filled with the generated message.
-            // dialoguer::Editor returns None if the user saves an empty file.
-            let editor = std::env::var("GAC_EDITOR")
-                .or_else(|_| std::env::var("EDITOR"))
-                .or_else(|_| std::env::var("VISUAL"))
-                .unwrap_or_else(|_| "nvim".into());
+            let editor = if command_exists("nvim") {
+                "nvim".into()
+            } else {
+                std::env::var("GAC_EDITOR")
+                    .or_else(|_| std::env::var("EDITOR"))
+                    .or_else(|_| std::env::var("VISUAL"))
+                    .unwrap_or_else(|_| {
+                        if cfg!(target_os = "windows") {
+                            "start notepad.exe".into()
+                        } else {
+                            "open -t".into()
+                        }
+                    })
+            };
             let edited = Editor::new()
                 .executable(&editor)
                 .require_save(true) // treat empty save as abort
@@ -130,14 +122,20 @@ fn approval_dialog(message: &str) -> anyhow::Result<Approval> {
                 Some(msg) => {
                     let trimmed = msg.trim().to_string();
                     if trimmed.is_empty() {
-                        warn!("empty message after edit — aborting");
+                        println!(
+                            "{}",
+                            console::style("⚠️ Empty message after edit. Aborting.")
+                        );
                         Ok(Approval::Abort)
                     } else {
                         Ok(Approval::Edit(trimmed))
                     }
                 }
                 None => {
-                    warn!("editor closed without saving — aborting");
+                    println!(
+                        "{}",
+                        console::style("⚠️ Editor closed without saving. Aborting.")
+                    );
                     Ok(Approval::Abort)
                 }
             }
@@ -151,16 +149,6 @@ fn approval_dialog(message: &str) -> anyhow::Result<Approval> {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialise logging before anything else
-    let log_level = match (cli.quiet, cli.verbose, cli.debug) {
-        (true, _, _) => LogLevel::Quiet,
-        (_, _, true) => LogLevel::Debug,
-        (_, true, _) => LogLevel::Verbose,
-        _ => LogLevel::Normal,
-    };
-
-    logging::init(log_level);
-
     if let Some(cmd) = cli.command {
         return match cmd {
             Commands::Init => init_config(),
@@ -172,28 +160,18 @@ async fn main() -> Result<()> {
     config.apply_cli_overrides(cli.model);
     config.validate()?;
 
-    // ── API key resolution ───────────────────────────────────────────────
+    // ── API Key Resolution ───────────────────────────────────────────────
     // Priority: CLI flag (--api-key) > env var (GAC_API_KEY) > config file > prompt
     let api_key = cli.api_key.or_else(|| config.api_key.clone());
 
     let api_key = match api_key {
         Some(key) if !key.is_empty() => Some(key),
-        _ if cli.print => {
-            bail!(
-                "no API key configured — use --api-key flag, GAC_API_KEY env var,
-  \
-                   or configure in ~/.config/gac/config.toml"
-            );
-        }
         _ => {
             use dialoguer::Password;
 
-            eprintln!(
-                "{}",
-                dialoguer::console::style("● No API key configured.").cyan()
-            );
+            eprintln!("{}", console::style("⚠️ No API key configured.").yellow());
             let key = Password::new()
-                .with_prompt("Enter your llama-swap API key")
+                .with_prompt("Enter your API key")
                 .interact()?;
 
             if key.is_empty() {
@@ -203,7 +181,7 @@ async fn main() -> Result<()> {
             Config::save_api_key(&key)?;
             eprintln!(
                 "{}",
-                dialoguer::console::style("✔ API key saved to ~/.config/gac/config.toml")
+                console::style("✔️ API key saved to ~/.config/gac/config.toml")
                     .green()
                     .bold()
             );
@@ -211,84 +189,54 @@ async fn main() -> Result<()> {
         }
     };
 
-    // ── HTTP client (reused across all API calls) ─────────────────────────
+    // ── HTTP Client (Reused across all API calls) ─────────────────────────
     let client = llamaswap::create_client(api_key.as_deref());
 
-    // ── Shared MultiProgress — all spinners/bars share one instance ───────
-    let mp = spinner::multi();
-    let mut steps = if cli.quiet || cli.print {
-        None
-    } else {
-        Some(spinner::StepTracker::new(&mp, config.max_completion_tokens))
-    };
+    let mut prog = progress::Progress::new();
 
-    // ── Staged files ──────────────────────────────────────────────────────
+    // ── Staged Files ──────────────────────────────────────────────────────
+    prog.start_staging();
     let all_staged = git::get_staged_files()?;
-    debug!(count = all_staged.len(), "found staged files");
-
     let excluded = git::get_excluded_files(&all_staged, &config.exclude_patterns);
+    prog.finish_staging(&all_staged, &excluded);
 
-    if !excluded.is_empty() {
-        warn!(
-            files = %excluded.join(", "),
-            "filtered lock/generated files"
-        );
-    }
+    // ── Scope Detection ───────────────────────────────────────────────────
+    prog.start_scope();
+    let scope_match = git::detect_scopes(prog.clone(), &all_staged, &config.scopes);
+    prog.finish_scope(&config.scopes, &scope_match);
 
-    // ── Scope detection ───────────────────────────────────────────────────
-    let scope_match = git::detect_scopes(&all_staged, &config.scopes);
-
-    if !config.scopes.is_empty() {
-        if !scope_match.matched.is_empty() {
-            info!(scopes = %scope_match.matched.join(", "), "detected scopes");
-        } else {
-            info!(
-                available = %scope_match.unmatched.join(", "),
-                "no scope auto-matched"
-            );
-        }
-    }
-
-    // ── Raw diff ──────────────────────────────────────────────────────────
+    // ── Raw Diff ──────────────────────────────────────────────────────────
+    prog.start_strategy();
     let (stat, raw_diff) = git::get_staged_stat_and_diff(&config.exclude_patterns)?;
-    if let Some(ref mut steps) = steps {
-        let file_count = raw_diff
-            .lines()
-            .filter(|l| l.starts_with("diff --git"))
-            .count();
-        steps.finish(format!("{} files, {} chars", file_count, raw_diff.len()));
-    }
     let file_diffs = diff::parse_diff(&raw_diff);
-    if let Some(ref mut steps) = steps {
-        steps.finish(format!("{} files scored", file_diffs.len()));
-    }
-    let (strategy, ctx) = diff::select_strategy(&client, &config, &raw_diff, &scope_match, &stat)
-        .await
-        .context("failed to select diff strategy")?;
-    if let Some(ref mut steps) = steps {
-        steps.finish(format!("{}", strategy));
-    }
-
-    info!(
-        diff_chars = raw_diff.len(),
-        files      = file_diffs.len(),
-        strategy   = %strategy,
-        "diff strategy selected"
+    let (strategy, ctx, tokens) = diff::select_strategy(
+        &client,
+        &config,
+        &raw_diff,
+        &file_diffs,
+        &scope_match,
+        &stat,
+    )
+    .await
+    .context("failed to select diff strategy")?;
+    prog.finish_strategy(
+        &strategy.to_string(),
+        file_diffs.len(),
+        raw_diff.len(),
+        tokens,
     );
 
     // ── Build context via chosen strategy ─────────────────────────────────
+    prog.start_context();
     let context = match &strategy {
         Strategy::Direct => ctx,
         Strategy::Summarize => {
-            info!(files = file_diffs.len(), "summarizing files individually");
-
-            // One shared progress bar for the whole summarize pass
-            let bar = spinner::summarize_bar(&mp, file_diffs.len());
+            prog.start_summarize(file_diffs.len() as u64);
+            let started = Instant::now();
             let budget = llamaswap::model_ctx_len(&client, &config)
                 .await
                 .context("failed to fetch model properties")?;
             let mut summaries: HashMap<String, String> = HashMap::new();
-            let mut completed = 0u64;
 
             for fd in &file_diffs {
                 let tokens = llamaswap::tokenize(&client, &config, &fd.content)
@@ -310,16 +258,25 @@ async fn main() -> Result<()> {
                 let p = prompt::build_file_summary_prompt(&fd.path, diff_ref);
                 let result = llamaswap::summarize(&client, &config, &p).await;
 
-                completed += 1;
-                bar.set_position(completed);
+                prog.inc_summarize(1);
 
                 match result {
                     Ok(s) => {
-                        debug!(path = %fd.path, summary = %s, "file summarized");
                         summaries.insert(fd.path.clone(), s);
                     }
                     Err(e) => {
-                        warn!(path = %fd.path, error = %e, "file summarization failed");
+                        prog.println(
+                            console::style(format!("Summarization failed for file `{}`", fd.path))
+                                .red()
+                                .to_string(),
+                        )
+                        .ok();
+                        prog.println(
+                            console::style(format!("Summarization Error: {}", e))
+                                .dim()
+                                .to_string(),
+                        )
+                        .ok();
                         summaries.insert(
                             fd.path.clone(),
                             "(summary failed — see stat for details)".into(),
@@ -328,60 +285,36 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Finish bar at 100 %
-            bar.set_position(file_diffs.len() as u64);
-            spinner::done(&bar, format!("summarized {} files", file_diffs.len()));
-
             let body = diff::build_summary_context(&summaries);
+            prog.println(format!(
+                "✔️ {} file(s) summarized in {}",
+                console::style(file_diffs.len()).yellow(),
+                console::style(indicatif::HumanDuration(started.elapsed())).yellow()
+            ))
+            .ok();
+            prog.finish_summarize();
             format!("=== Stat ===\n{stat}\n\n{body}")
         }
         Strategy::StatOnly { top_n } => {
-            info!(
-                top_n = top_n,
-                total = file_diffs.len(),
-                skipped = file_diffs.len().saturating_sub(*top_n),
-                "using stat-only strategy"
-            );
+            prog.println(format!(
+                "⚠️ Using stat-only strategy. Top-N: {} Total: {} Skipped: {}",
+                console::style(top_n).yellow(),
+                console::style(file_diffs.len()).yellow(),
+                console::style(file_diffs.len().saturating_sub(*top_n)).yellow()
+            ))
+            .ok();
             diff::build_stat_context(&stat, &file_diffs, *top_n)
         }
     };
+    prog.finish_context();
 
     // ── Generate commit message ───────────────────────────────────────────
+    prog.start_generation();
+    let started = Instant::now();
     let candidates = scope_match.best_candidates();
     let commit_prompt = prompt::build_commit_prompt(&context, &candidates);
-    if let Some(ref mut steps) = steps {
-        steps.finish("prompt built");
-    }
-
-    info!(
-        model   = %config.model,
-        "generating commit message"
-    );
-
-    // mp is passed in so the generation spinner shares the same draw target
-    // as any bars that were active during the summarize pass.
-    let (mut message, gen_stats) = if let Some(ref mut steps) = steps {
-        llamaswap::generate_streaming(&client, &config, &commit_prompt, steps, &mp, cli.quiet)
-            .await?
-    } else {
-        // In quiet/print mode, create a temporary step tracker just for the call
-        let mut temp_steps = spinner::StepTracker::new(&mp, config.max_completion_tokens);
-        temp_steps.clear();
-        llamaswap::generate_streaming(
-            &client,
-            &config,
-            &commit_prompt,
-            &mut temp_steps,
-            &mp,
-            cli.quiet,
-        )
-        .await?
-    };
-    // Print stats immediately after generation, before the approval dialog.
-    // In quiet mode the live bar is already suppressed, so keep stderr quiet too.
-    if !cli.quiet {
-        gen_stats.print();
-    }
+    let (mut message, mut gen_stats) =
+        llamaswap::generate_streaming(&client, &config, &commit_prompt, &prog).await?;
 
     // ── Validate and auto-retry if needed ─────────────────────────────────
     const MAX_VALIDATION_RETRIES: usize = 2;
@@ -390,134 +323,105 @@ async fn main() -> Result<()> {
     loop {
         match validate::validate_conventional_commit(&message) {
             Ok(()) => {
-                if let Some(ref mut steps) = steps {
-                    steps.finish("passed");
-                }
                 break;
             }
             Err(reason) if retries < MAX_VALIDATION_RETRIES => {
                 retries += 1;
-                if let Some(ref mut steps) = steps {
-                    steps.show_retry(format!("retry {}/{}", retries, MAX_VALIDATION_RETRIES));
-                }
-                warn!(
-                    reason,
-                    message = &message,
-                    retry = retries,
-                    "commit message validation failed — retrying"
-                );
+                prog.println(
+                    console::style(format!(
+                        "⚠️ Commit message validation failed. Retrying: {}",
+                        retries
+                    ))
+                    .yellow()
+                    .to_string(),
+                )
+                .ok();
+                prog.println(
+                    console::style(format!("⚠️ Reason: {}", reason))
+                        .dim()
+                        .to_string(),
+                )
+                .ok();
 
                 let retry_prompt =
                     prompt::build_retry_prompt(&context, &candidates, &message, &reason);
-                let (retry_msg, retry_stats) = if let Some(ref mut steps) = steps {
-                    llamaswap::generate_streaming(
-                        &client,
-                        &config,
-                        &retry_prompt,
-                        steps,
-                        &mp,
-                        cli.quiet,
-                    )
-                    .await?
-                } else {
-                    let mut temp_steps =
-                        spinner::StepTracker::new(&mp, config.max_completion_tokens);
-                    temp_steps.clear();
-                    llamaswap::generate_streaming(
-                        &client,
-                        &config,
-                        &retry_prompt,
-                        &mut temp_steps,
-                        &mp,
-                        cli.quiet,
-                    )
-                    .await?
-                };
-                if !cli.quiet {
-                    retry_stats.print_quiet_summary();
-                }
+                let (retry_msg, retry_stats) =
+                    llamaswap::generate_streaming(&client, &config, &retry_prompt, &prog).await?;
                 message = retry_msg;
+                gen_stats = retry_stats;
             }
             Err(reason) => {
-                if let Some(ref mut steps) = steps {
-                    steps.finish(format!("failed: {}", reason));
-                }
-                warn!(
-                    reason,
-                    "commit message validation failed after retries — attempting auto-fix"
-                );
+                prog.println(
+                    console::style(
+                        "⚠️ Commit message validation failed after retries. Attempting auto-fix.",
+                    )
+                    .yellow()
+                    .to_string(),
+                )
+                .ok();
+                prog.println(
+                    console::style(format!("⚠️ Reason: {}", reason))
+                        .dim()
+                        .to_string(),
+                )
+                .ok();
+
                 let fixed = validate::try_fix_commit_message(&message);
+
                 if validate::validate_conventional_commit(&fixed).is_ok() {
-                    if let Some(ref mut steps) = steps {
-                        steps.finish("auto-fixed");
-                    }
-                    info!("auto-fix succeeded");
                     message = fixed;
                 } else {
-                    if let Some(ref mut steps) = steps {
-                        steps.finish("manual edit required");
-                    }
-                    warn!("auto-fix failed — user will need to edit manually");
+                    prog.println(
+                        console::style("⚠️ Auto-fix failed. User will need to edit manually.")
+                            .yellow()
+                            .to_string(),
+                    )
+                    .ok();
                 }
                 break;
             }
         }
     }
 
-    // ── Approval + commit ─────────────────────────────────────────────────
-    if let Some(ref steps) = steps {
-        steps.clear();
-    }
-    let final_message = if cli.print {
-        // Print-only mode: output to stdout and exit
-        println!("{message}");
-        return Ok(());
-    } else {
-        match approval_dialog(&message)? {
-            Approval::Commit => {
-                debug!("user confirmed commit");
-                message
-            }
-            Approval::Edit(edited) => {
-                info!("user edited commit message");
-                // Show the edited message before committing
-                println!(
-                    "\n{}\n{}\n{}",
-                    dialoguer::console::style("── Edited commit message ──").dim(),
-                    edited,
-                    dialoguer::console::style("───────────────────────────").dim(),
-                );
+    prog.finish_generation(started);
+    gen_stats.print();
 
-                // One final confirmation after editing so the user can't
-                // accidentally commit a half-finished message.
-                let confirmed =
-                    dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
-                        .with_prompt("Commit with edited message?")
-                        .default(true)
-                        .interact()?;
+    // ── Approval + Commit ─────────────────────────────────────────────────
+    let final_message = match approval_dialog(&message)? {
+        Approval::Commit => message,
+        Approval::Edit(edited) => {
+            // Show the edited message before committing
+            println!(
+                "\n{}\n{}\n{}",
+                dialoguer::console::style(format!("── Edited Commit Message {}", "─".repeat(30)))
+                    .dim(),
+                edited,
+                dialoguer::console::style("─".repeat(55)).dim(),
+            );
 
-                if confirmed {
-                    edited
-                } else {
-                    info!("user aborted after edit");
-                    return Ok(());
-                }
-            }
-            Approval::Abort => {
-                info!("user aborted");
+            // One final confirmation after editing so the user can't
+            // accidentally commit a half-finished message.
+            let confirmed =
+                dialoguer::Confirm::with_theme(&dialoguer::theme::ColorfulTheme::default())
+                    .with_prompt("Commit with edited message?")
+                    .default(true)
+                    .interact()?;
+
+            if confirmed {
+                edited
+            } else {
                 return Ok(());
             }
         }
+        Approval::Abort => {
+            return Ok(());
+        }
     };
 
-    debug!(message = %final_message, "running git commit");
     if git::commit(&final_message, cli.no_verify)? {
-        if let Some(ref mut steps) = steps {
-            steps.finish("done");
-        }
-        info!("committed successfully");
+        eprintln!("Committed successfully.");
     } else {
-        anyhow::bail!("git commit failed");
+        anyhow::bail!("Git commit failed.");
     }
 
     Ok(())
