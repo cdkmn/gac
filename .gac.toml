@@ -4,7 +4,7 @@
 endpoint = "http://localhost:11438"
 
 # Model name for generation
-model = "Gemma-4:E4B-QAT" #"Sweep-Next:1.5B"
+model = "Gemma-4:E4B-QAT"  # "Sweep-Next:1.5B"
 
 # An upper bound for the number of tokens that can be generated for a completion, including visible output tokens and reasoning tokens
 max_completion_tokens = 4096
@@ -27,23 +27,29 @@ paths = [".agents/**", ".claude/**"]
 [scopes.config]
 paths = ["src/config.rs"]
 
+[scopes.crypto]
+paths = ["src/crypto.rs"]
+
 [scopes.diff]
 paths = ["src/diff.rs"]
 
 [scopes.git]
 paths = ["src/git.rs"]
 
-[scopes.logging]
-paths = ["src/logging.rs"]
-
 [scopes.llama]
 paths = ["src/llamaswap.rs"]
+
+[scopes.progress]
+paths = ["src/progress.rs"]
 
 [scopes.prompt]
 paths = ["src/prompt.rs"]
 
 [scopes.stats]
 paths = ["src/stats.rs"]
+
+[scopes.validation]
+paths = ["src/validate.rs"]
 
 [scopes.cli]
 paths = ["src/main.rs"]
