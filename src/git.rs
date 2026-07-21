@@ -1,26 +1,17 @@
+use std::{collections::HashMap, process::Command};
+
 use anyhow::{Context, Result};
 use glob::Pattern;
-use std::{collections::HashMap, process::Command};
-use tracing::{debug, info, warn};
 
-use crate::config::ScopeEntry;
+use crate::{config::ScopeEntry, progress::Progress};
 
 // ── Staged diff ───────────────────────────────────────────────────────────
 
 /// Returns `(stat, raw_diff)`. The stat is always the full summary;
 /// the diff body is un-truncated so `diff::parse_diff` can split it properly.
 pub fn get_staged_stat_and_diff(exclude_patterns: &[String]) -> anyhow::Result<(String, String)> {
-    info!("reading staged diff");
-
-    debug!(
-        exclude_count = exclude_patterns.len(),
-        "applying path exclusions"
-    );
-
     let excludes = build_excludes(exclude_patterns);
     let stat = run_git_diff(&["diff", "--cached", "--stat", "--"], &excludes)?;
-
-    debug!(stat = %stat.trim(), "git diff --stat");
 
     if stat.trim().is_empty() {
         anyhow::bail!("No staged changes found. Run `git add` first.");
@@ -56,7 +47,6 @@ pub fn get_staged_files() -> Result<Vec<String>> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        warn!(error = %stderr, "git diff --cached --name-only failed");
         anyhow::bail!("git diff failed: {}", stderr);
     }
 
@@ -79,10 +69,7 @@ pub fn get_excluded_files(all: &[String], exclude_patterns: &[String]) -> Vec<St
             .lines()
             .map(|l| l.to_string())
             .collect(),
-        Err(e) => {
-            warn!(error = %e, "failed to run git diff with excludes");
-            std::collections::HashSet::new()
-        }
+        Err(_) => std::collections::HashSet::new(),
     };
 
     all.iter().filter(|f| !kept.contains(*f)).cloned().collect()
@@ -112,7 +99,11 @@ impl ScopeMatch {
 
 /// Match `staged_files` against every scope's glob patterns.
 /// A scope matches if ANY staged file matches ANY of its patterns.
-pub fn detect_scopes(staged_files: &[String], scopes: &HashMap<String, ScopeEntry>) -> ScopeMatch {
+pub fn detect_scopes(
+    prog: Progress,
+    staged_files: &[String],
+    scopes: &HashMap<String, ScopeEntry>,
+) -> ScopeMatch {
     let mut matched = Vec::new();
     let mut unmatched = Vec::new();
     // Sort for deterministic output
@@ -129,15 +120,18 @@ pub fn detect_scopes(staged_files: &[String], scopes: &HashMap<String, ScopeEntr
         }
 
         let mut compiled = Vec::new();
+
         for p in patterns {
+            let prog = prog.clone();
             match Pattern::new(p) {
                 Ok(pat) => compiled.push(pat),
-                Err(e) => warn!(
-                    scope = %name,
-                    pattern = %p,
-                    error = %e,
-                    "invalid glob pattern in scope definition — skipped"
-                ),
+                Err(e) => {
+                    prog.println(format!(
+                        " {} Scope: {} Pattern: {} Error: {}",
+                        "Invalid glob pattern in scope definition — skipped", name, p, e,
+                    ))
+                    .ok();
+                }
             }
         }
 
@@ -151,12 +145,6 @@ pub fn detect_scopes(staged_files: &[String], scopes: &HashMap<String, ScopeEntr
             unmatched.push(name.clone());
         }
     }
-
-    debug!(
-        defined  = scopes.len(),
-        matched  = ?matched,
-        "scope detection complete"
-    );
 
     ScopeMatch { matched, unmatched }
 }
@@ -192,7 +180,6 @@ fn run_git_diff(base_args: &[&str], extra: &[String]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ScopeEntry;
 
     // ── build_excludes ─────────────────────────────────────────────────────
 
@@ -224,7 +211,10 @@ mod tests {
             ScopeEntry::PathsOnly(vec!["src/api/**".into()]),
         )]);
         let staged = vec!["src/api/handler.rs".into()];
-        let result = detect_scopes(&staged, &scopes);
+        let mut prog = Progress::new();
+        prog.start_scope();
+        let result = detect_scopes(prog.clone(), &staged, &scopes);
+        prog.finish_scope(&scopes, &result);
         assert_eq!(result.matched, vec!["api"]);
         assert!(result.unmatched.is_empty());
     }
@@ -236,7 +226,10 @@ mod tests {
             ScopeEntry::PathsOnly(vec!["src/api/**".into()]),
         )]);
         let staged = vec!["src/main.rs".into()];
-        let result = detect_scopes(&staged, &scopes);
+        let mut prog = Progress::new();
+        prog.start_scope();
+        let result = detect_scopes(prog.clone(), &staged, &scopes);
+        prog.finish_scope(&scopes, &result);
         assert!(result.matched.is_empty());
         assert_eq!(result.unmatched, vec!["api"]);
     }
@@ -245,7 +238,10 @@ mod tests {
     fn detect_scopes_empty_patterns_go_to_unmatched() {
         let scopes = make_scopes(vec![("release", ScopeEntry::PathsOnly(vec![]))]);
         let staged = vec!["anything.rs".into()];
-        let result = detect_scopes(&staged, &scopes);
+        let mut prog = Progress::new();
+        prog.start_scope();
+        let result = detect_scopes(prog.clone(), &staged, &scopes);
+        prog.finish_scope(&scopes, &result);
         assert!(result.matched.is_empty());
         assert_eq!(result.unmatched, vec!["release"]);
     }
@@ -257,7 +253,10 @@ mod tests {
             ("a_scope", ScopeEntry::PathsOnly(vec!["a/**".into()])),
         ]);
         let staged = vec!["a/file.rs".into(), "z/file.rs".into()];
-        let result = detect_scopes(&staged, &scopes);
+        let mut prog = Progress::new();
+        prog.start_scope();
+        let result = detect_scopes(prog.clone(), &staged, &scopes);
+        prog.finish_scope(&scopes, &result);
         assert_eq!(result.matched, vec!["a_scope", "z_scope"]);
     }
 
@@ -270,7 +269,10 @@ mod tests {
             },
         )]);
         let staged = vec!["src/auth/jwt.rs".into()];
-        let result = detect_scopes(&staged, &scopes);
+        let mut prog = Progress::new();
+        prog.start_scope();
+        let result = detect_scopes(prog.clone(), &staged, &scopes);
+        prog.finish_scope(&scopes, &result);
         assert_eq!(result.matched, vec!["auth"]);
     }
 
