@@ -47,7 +47,7 @@ fn derive_key(password: &str, salt: Option<&[u8]>) -> Result<(Vec<u8>, [u8; KEY_
 }
 
 /// Get the encryption password from environment variable or use a default.
-/// In a real application, you'd want to use a more secure key derivation
+/// In a real application, you'd want to use a securer key derivation
 /// (e.g., Argon2, PBKDF2) and store the password securely.
 fn get_password() -> String {
     std::env::var("GAC_ENCRYPTION_KEY")
