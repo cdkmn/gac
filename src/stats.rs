@@ -1,5 +1,10 @@
 // ── Raw stats captured from llama-swap ──────────────────────────────────
 
+use std::time::Duration;
+
+use console::style;
+use indicatif::HumanDuration;
+
 /// Token and timing stats from the final `/api/chat` done-chunk.
 #[derive(Debug, Default)]
 pub struct GenerationStats {
@@ -7,11 +12,11 @@ pub struct GenerationStats {
     pub input_tokens: u64,
     /// Tokens in the generated response.
     pub output_tokens: u64,
-    /// Time spent evaluating the prompt (Millis).
+    /// Time spent evaluating the prompt (Millisecond).
     pub prompt_eval_ms: f64,
-    /// Time spent generating the response (Millis).
+    /// Time spent generating the response (Millisecond).
     pub eval_ms: f64,
-    /// Total end-to-end time including model load (Millis).
+    /// Total end-to-end time including model load (Millisecond).
     pub total_ms: f64,
     pub tokens_per_second: f64,
     /// VRAM Stats
@@ -21,40 +26,9 @@ pub struct GenerationStats {
 }
 
 impl GenerationStats {
-    // ── Display ────────────────────────────────────────────────────────────
-
     pub fn print(&self) {
-        use dialoguer::console::style;
-
-        eprintln!(
-            "\n{}",
-            style("── Generation stats ──────────────────────").dim()
-        );
-
-        // Tokens
-        eprintln!(
-            "  {:20} {}  →  {}  (total: {})",
-            style("Tokens").cyan().bold(),
-            style(format!("{} in", self.input_tokens)).yellow(),
-            style(format!("{} out", self.output_tokens)).green(),
-            style(format!("{} total", self.input_tokens + self.output_tokens)).dim(),
-        );
-
-        // Speed
-        eprintln!(
-            "  {:20} {}",
-            style("Speed").cyan().bold(),
-            style(format!("{:.1} tok/s", self.tokens_per_second)).green(),
-        );
-
-        // Timing breakdown
-        eprintln!(
-            "  {:20} prompt {}ms  +  gen {}ms  =  total {}ms",
-            style("Time").cyan().bold(),
-            style(format!("{}", self.prompt_eval_ms)).yellow(),
-            style(format!("{}", self.eval_ms)).green(),
-            style(format!("{}", self.total_ms)).dim(),
-        );
+        let title = format!("── Generation Stats {}", "─".repeat(35));
+        eprintln!("\n{}", style(title).dim());
 
         // VRAM
         match self.vram_used_mb {
@@ -62,7 +36,7 @@ impl GenerationStats {
                 (Some(total), Some(pct)) => {
                     let bar = vram_bar(pct, 20);
                     eprintln!(
-                        "  {:20} {} [{bar}] {:.0}%",
+                        " {:10} {} [{bar}] {:.0}%",
                         style("VRAM").cyan().bold(),
                         style(format!("{used:.0}/{total:.0} MB")).magenta(),
                         pct,
@@ -70,7 +44,7 @@ impl GenerationStats {
                 }
                 _ => {
                     eprintln!(
-                        "  {:20} {}",
+                        " {:10} {}",
                         style("VRAM").cyan().bold(),
                         style(format!("{used:.0} MB used (total unknown)")).dim(),
                     );
@@ -78,41 +52,51 @@ impl GenerationStats {
             },
             _ => {
                 eprintln!(
-                    "  {:20} {}",
+                    " {:10} {}",
                     style("VRAM").cyan().bold(),
                     style("unavailable (is the model loaded?)").dim(),
                 );
             }
         }
 
+        // Timing breakdown
         eprintln!(
-            "{}",
-            style("──────────────────────────────────────────").dim()
+            " {:10} Prompt: {} + Gen: {} = Total: {}",
+            style("Time").cyan().bold(),
+            style(format!(
+                "{:#}",
+                HumanDuration(Duration::from_micros((self.prompt_eval_ms * 1000.0) as u64))
+            ))
+            .yellow(),
+            style(format!(
+                "{:#}",
+                HumanDuration(Duration::from_micros((self.eval_ms * 1000.0) as u64))
+            ))
+            .green(),
+            style(format!(
+                "{:#}",
+                HumanDuration(Duration::from_micros((self.total_ms * 1000.0) as u64))
+            ))
+            .cyan(),
         );
-    }
 
-    /// Minimal one-line summary used after a validation retry, where the full
-    /// block would be redundant noise. e.g. "out 84 tok · 41.2 tok/s · 2040ms"
-    pub fn print_quiet_summary(&self) {
-        use dialoguer::console::style;
+        // Tokens
         eprintln!(
-            "  {} {} · {} · {}ms",
-            style("out").dim(),
-            style(format!("{} tok", self.output_tokens)).green(),
-            style(format!("{:.1} tok/s", self.tokens_per_second)).green(),
-            style(format!("{}", self.total_ms as u64)).dim(),
+            " {:10} {} → {} ({}) ({})",
+            style("Tokens").cyan().bold(),
+            style(format!("{} In", self.input_tokens)).yellow(),
+            style(format!("{} Out", self.output_tokens)).green(),
+            style(format!("{:.1} tok/s", self.tokens_per_second)).cyan(),
+            style(format!("{} Total", self.input_tokens + self.output_tokens)).dim(),
         );
+
+        eprintln!("{}", style("─".repeat(55)).dim());
     }
 }
 
-// ── Visual VRAM bar ───────────────────────────────────────────────────────
-//
-// Renders a small Unicode block bar, e.g.:  [████████████░░░░░░░░]  62%
-// Colour shifts green → yellow → red as usage rises.
-
+/// Renders a small Unicode block bar, e.g.: [████████████░░░░░░░░] 62%
+/// Color shifts green → yellow → red as usage rises.
 fn vram_bar(pct: f64, width: usize) -> String {
-    use dialoguer::console::style;
-
     let filled = ((pct / 100.0) * width as f64).round() as usize;
     let filled = filled.min(width);
     let empty = width - filled;
@@ -122,6 +106,5 @@ fn vram_bar(pct: f64, width: usize) -> String {
         60..=84 => style(bar).yellow(),
         _ => style(bar).red(),
     };
-
     coloured.to_string()
 }
