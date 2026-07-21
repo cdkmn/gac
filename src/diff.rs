@@ -1,12 +1,11 @@
 use std::collections::HashMap;
-use tracing::debug;
 
 use crate::{config::Config, git::ScopeMatch, llamaswap, prompt};
 
-// ── Priority scoring ──────────────────────────────────────────────────────
+// ── Priority Scoring ──────────────────────────────────────────────────────
 //
-// High priority  → source code the model should read carefully
-// Low priority   → generated / config / docs the model can skip or skim
+// High priority → source code the model should read carefully
+// Low priority → generated / config / docs the model can skip or skim
 
 static HIGH_PRIORITY_EXT: &[&str] = &[
     "rs", "go", "py", "ts", "tsx", "js", "jsx", "c", "cpp", "h", "hpp", "java", "kt", "swift",
@@ -31,12 +30,12 @@ static LOW_PRIORITY_NAMES: &[&str] = &[
 
 const SUMMARIZE_THRESHOLD: usize = 20; // max files before switching to StatOnly
 
-// ── Per-file diff chunk ────────────────────────────────────────────────────
+// ── Per-file Diff Chunk ────────────────────────────────────────────────────
 #[derive(Debug, Clone)]
 pub struct FileDiff {
     pub path: String,
     pub priority: u8,    // 0 (low) – 100 (high); higher = include first
-    pub content: String, // full diff for this file including header
+    pub content: String, // Full diff for this file including header
 }
 
 // ── Strategy ──────────────────────────────────────────────────────────────
@@ -62,7 +61,7 @@ impl std::fmt::Display for Strategy {
     }
 }
 
-/// Score a file path 0-100.
+/// Score a filepath 0–100.
 fn score_file(path: &str) -> u8 {
     let path_buf = std::path::Path::new(path);
     let name = path_buf
@@ -171,7 +170,7 @@ pub async fn select_strategy(
     file_diffs: &[FileDiff],
     scope_match: &ScopeMatch,
     stat: &str,
-) -> anyhow::Result<(Strategy, String)> {
+) -> anyhow::Result<(Strategy, String, usize)> {
     let mut budget = llamaswap::model_ctx_len(client, config).await?;
     let body = build_direct_context(file_diffs);
     let context = format!("=== Stat ===\n{stat}\n=== Diff ===\n{body}");
@@ -179,19 +178,12 @@ pub async fn select_strategy(
     let commit_prompt = prompt::build_commit_prompt(&context, &candidates);
     let tokens = llamaswap::token_counts(client, config, &commit_prompt).await?;
 
-    debug!(
-        tokens = tokens,
-        file_count = file_diffs.len(),
-        budget = budget,
-        "selecting diff strategy"
-    );
-
     if tokens < budget as usize {
-        return Ok((Strategy::Direct, context));
+        return Ok((Strategy::Direct, context, tokens));
     }
 
     if file_diffs.len() <= SUMMARIZE_THRESHOLD {
-        return Ok((Strategy::Summarize, "".to_string()));
+        return Ok((Strategy::Summarize, "".to_string(), tokens));
     }
 
     // How many top-priority files can we fit in the budget?
@@ -213,10 +205,11 @@ pub async fn select_strategy(
             top_n: top_n.max(1),
         },
         "".to_string(),
+        tokens,
     ))
 }
 
-// ── Context builders ──────────────────────────────────────────────────────
+// ── Context Builders ──────────────────────────────────────────────────────
 
 /// Build a direct diff string from the sorted file list.
 /// Only used by `Strategy::Direct` (guaranteed to fit).
